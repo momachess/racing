@@ -1,2 +1,2 @@
 # racing
-Racing Simulation win NN and GA. Coded by Codex
+Racing Simulation with NN and GA. Coded by Codex
