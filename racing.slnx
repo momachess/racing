@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="code/racing.vcxproj" Id="a85c4fdf-179a-4983-8021-ac7860fdd9b8" />
+</Solution>
