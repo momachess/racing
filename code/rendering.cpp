@@ -24,7 +24,9 @@
 #define dwrite_factory (renderer->dwrite_factory)
 #define dwrite_format (renderer->dwrite_format)
 #define dwrite_pane_format (renderer->dwrite_pane_format)
+#define dwrite_button_format (renderer->dwrite_button_format)
 #define dwrite_gauge_format (renderer->dwrite_gauge_format)
+#define dwrite_gauge_tick_format (renderer->dwrite_gauge_tick_format)
 #define dwrite_speed_format (renderer->dwrite_speed_format)
 #define track_zoom (renderer->track_zoom)
 #define track_pan_x (renderer->track_pan_x)
@@ -82,6 +84,23 @@ HRESULT create_d2d_resources(RendererContext *renderer, HWND window)
             DWRITE_FONT_STRETCH_NORMAL,
             14.0f,
             L"en-US",
+            &dwrite_button_format);
+        if (FAILED(result))
+            return result;
+
+        dwrite_button_format->SetTextAlignment(
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+        dwrite_button_format->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        result = dwrite_factory->CreateTextFormat(
+            L"Consolas",
+            NULL,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            14.0f,
+            L"en-US",
             &dwrite_pane_format);
         if (FAILED(result))
             return result;
@@ -113,6 +132,23 @@ HRESULT create_d2d_resources(RendererContext *renderer, HWND window)
         dwrite_gauge_format->SetTextAlignment(
             DWRITE_TEXT_ALIGNMENT_CENTER);
         dwrite_gauge_format->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        result = dwrite_factory->CreateTextFormat(
+            L"Segoe UI",
+            NULL,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            13.0f,
+            L"",
+            &dwrite_gauge_tick_format);
+        if (FAILED(result))
+            return result;
+
+        dwrite_gauge_tick_format->SetTextAlignment(
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+        dwrite_gauge_tick_format->SetParagraphAlignment(
             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         result = dwrite_factory->CreateTextFormat(
@@ -186,12 +222,12 @@ HRESULT create_d2d_resources(RendererContext *renderer, HWND window)
         if (FAILED(result))
             return result;
         result = d2d_target->CreateSolidColorBrush(
-            D2D1::ColorF(0.84f, 0.86f, 0.88f),
+            D2D1::ColorF(0.24f, 0.43f, 0.64f),
             &d2d_tick_brush);
         if (FAILED(result))
             return result;
         result = d2d_target->CreateSolidColorBrush(
-            D2D1::ColorF(0.96f, 0.97f, 0.98f),
+            D2D1::ColorF(0.78f, 0.88f, 1.00f),
             &d2d_gauge_text_brush);
         if (FAILED(result))
             return result;
@@ -582,6 +618,25 @@ void draw_d2d_pane_text(
             brush);
 }
 
+void draw_d2d_button_text(
+    RendererContext *renderer,
+    const char *text,
+    const D2D1_RECT_F *rectangle,
+    ID2D1Brush *brush)
+{
+    wchar_t wide_text[64];
+    int length = MultiByteToWideChar(
+        CP_ACP, 0, text, -1, wide_text, 64);
+
+    if (length > 0)
+        d2d_target->DrawText(
+            wide_text,
+            length - 1,
+            dwrite_button_format,
+            *rectangle,
+            brush);
+}
+
 void draw_d2d_gauge_text(
     RendererContext *renderer,
     const char *text,
@@ -620,6 +675,27 @@ void draw_d2d_speed_text(
             wide_text,
             length - 1,
             dwrite_speed_format,
+            D2D1::RectF(x, y, x + width, y + height),
+            d2d_gauge_text_brush);
+}
+
+void draw_d2d_gauge_tick_text(
+    RendererContext *renderer,
+    const char *text,
+    float x,
+    float y,
+    float width,
+    float height)
+{
+    wchar_t wide_text[64];
+    int length = MultiByteToWideChar(
+        CP_ACP, 0, text, -1, wide_text, 64);
+
+    if (length > 0)
+        d2d_target->DrawText(
+            wide_text,
+            length - 1,
+            dwrite_gauge_tick_format,
             D2D1::RectF(x, y, x + width, y + height),
             d2d_gauge_text_brush);
 }
@@ -845,12 +921,12 @@ int render_direct2d(
         gauge_radius,
         gauge_start,
         gauge_start - 0.2f * 270.0f * (float)M_PI / 180.0f,
-        d2d_red_brush,
+        d2d_blue_brush,
         12.0f);
 
     d2d_target->DrawEllipse(
         D2D1::Ellipse(D2D1::Point2F((float)gauge_x, (float)gauge_y),
-                      gauge_radius - 50.0f, gauge_radius - 50.0f),
+                      gauge_radius - 64.0f, gauge_radius - 64.0f),
         d2d_tick_brush,
         1.5f);
 
@@ -867,13 +943,13 @@ int render_direct2d(
             gauge_y - sinf(angle) * (gauge_radius - 5.0f));
         d2d_target->DrawLine(
             a, b,
-            tick >= 28 ? d2d_red_brush : d2d_tick_brush,
+            tick >= 28 ? d2d_blue_brush : d2d_tick_brush,
             tick % 5 == 0 ? 3.0f : 2.0f);
     }
 
     float needle_angle = gauge_start -
         speed_ratio * 270.0f * (float)M_PI / 180.0f;
-    float needle_inner_radius = gauge_radius - 50.0f;
+    float needle_inner_radius = gauge_radius - 64.0f;
     D2D1_POINT_2F needle_start = D2D1::Point2F(
         gauge_x + cosf(needle_angle) * needle_inner_radius,
         gauge_y - sinf(needle_angle) * needle_inner_radius);
@@ -883,7 +959,7 @@ int render_direct2d(
     d2d_target->DrawLine(
         needle_start,
         needle_end,
-        d2d_red_brush,
+        d2d_blue_brush,
         4.0f);
 
     char speed_text[32];
@@ -899,7 +975,7 @@ int render_direct2d(
         float label_radius = gauge_radius - 39.0f;
         char label_text[8];
         snprintf(label_text, sizeof(label_text), "%d", label * 50);
-        draw_d2d_gauge_text(renderer, 
+        draw_d2d_gauge_tick_text(renderer,
             label_text,
             gauge_x + cosf(angle) * label_radius - 14.0f,
             gauge_y - sinf(angle) * label_radius - 10.0f,
@@ -1105,11 +1181,11 @@ int render_direct2d(
                 ? d2d_command_hover_brush
                 : d2d_command_brush);
         d2d_target->DrawRectangle(rect, d2d_pane_border_brush, 1.0f);
-        draw_d2d_pane_text(renderer, labels[command], x + 6.0f,
-                           command_y + 9.0f,
-                           RIGHT_PANE_BUTTON_WIDTH - 12.0f, 18.0f,
-                           disabled ? d2d_pane_label_brush :
-                                      d2d_pane_value_brush);
+        draw_d2d_button_text(
+            renderer,
+            labels[command],
+            &rect,
+            disabled ? d2d_pane_label_brush : d2d_pane_value_brush);
     }
 
     HRESULT result = d2d_target->EndDraw();
@@ -1126,7 +1202,9 @@ void renderer_context_shutdown(RendererContext *renderer)
     release_d2d(&d2d_round_stroke);
     release_d2d(&dwrite_format);
     release_d2d(&dwrite_pane_format);
+    release_d2d(&dwrite_button_format);
     release_d2d(&dwrite_gauge_format);
+    release_d2d(&dwrite_gauge_tick_format);
     release_d2d(&dwrite_speed_format);
     release_d2d(&dwrite_factory);
     release_d2d(&d2d_factory);

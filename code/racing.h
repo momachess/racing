@@ -397,7 +397,9 @@ typedef struct {
     IDWriteFactory *dwrite_factory;
     IDWriteTextFormat *dwrite_format;
     IDWriteTextFormat *dwrite_pane_format;
+    IDWriteTextFormat *dwrite_button_format;
     IDWriteTextFormat *dwrite_gauge_format;
+    IDWriteTextFormat *dwrite_gauge_tick_format;
     IDWriteTextFormat *dwrite_speed_format;
     float track_zoom;
     int track_pan_x;
