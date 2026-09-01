@@ -70,6 +70,46 @@ int right_pane_command_at(
         (RIGHT_PANE_WIDTH - group_width) / 2;
     int button_top = client->bottom - 60;
 
+    int source_left = pane_left +
+        (RIGHT_PANE_WIDTH - RIGHT_PANE_TRAIN_SOURCE_WIDTH) / 2;
+    int source_top = button_top -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
+
+    int fitness_width = RIGHT_PANE_FITNESS_BUTTON_WIDTH * 3 +
+        RIGHT_PANE_FITNESS_BUTTON_GAP * 2;
+    int fitness_left = pane_left +
+        (RIGHT_PANE_WIDTH - fitness_width) / 2;
+    int fitness_top = source_top -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_FITNESS_BUTTON_HEIGHT;
+    if (y >= fitness_top &&
+        y < fitness_top + RIGHT_PANE_FITNESS_BUTTON_HEIGHT)
+    {
+        int fitness_offset = x - fitness_left;
+        if (fitness_offset >= 0) {
+            int fitness_column = fitness_offset /
+                (RIGHT_PANE_FITNESS_BUTTON_WIDTH +
+                 RIGHT_PANE_FITNESS_BUTTON_GAP);
+            if (fitness_column >= 0 && fitness_column < 3 &&
+                fitness_offset %
+                    (RIGHT_PANE_FITNESS_BUTTON_WIDTH +
+                     RIGHT_PANE_FITNESS_BUTTON_GAP) <
+                    RIGHT_PANE_FITNESS_BUTTON_WIDTH)
+            {
+                return 5 + fitness_column;
+            }
+        }
+    }
+
+    if (x >= source_left &&
+        x < source_left + RIGHT_PANE_TRAIN_SOURCE_WIDTH &&
+        y >= source_top &&
+        y < source_top + RIGHT_PANE_TRAIN_SOURCE_HEIGHT)
+    {
+        return 4;
+    }
+
     if (y < button_top || y >= button_top + RIGHT_PANE_BUTTON_HEIGHT)
         return -1;
 
@@ -89,9 +129,15 @@ int right_pane_command_at(
     return column;
 }
 
-int right_pane_command_is_disabled(int command)
+int right_pane_command_is_disabled(
+    int command,
+    int training_is_running,
+    int workers_are_active)
 {
-    (void)command;
+    if (command >= 4 && command <= 7)
+        return training_is_running || workers_are_active;
+    if (command == 0 && !training_is_running && workers_are_active)
+        return 1;
     return 0;
 }
 
@@ -132,7 +178,7 @@ void save_network(ApplicationContext *application)
         return;
     }
 
-    const char magic[8] = {'R', 'A', 'C', 'E', 'N', 'N', '4', '\0'};
+    const char magic[8] = {'R', 'A', 'C', 'E', 'N', 'N', '6', '\0'};
     int gene_count = NN_GENOME_COUNT;
     float genes[NN_GENOME_COUNT];
     if (ga_best_genome.fitness > -FLT_MAX)
@@ -165,7 +211,7 @@ void load_network(ApplicationContext *application)
         fread(&gene_count, sizeof(gene_count), 1, file) == 1 &&
         fread(genes, sizeof(genes), 1, file) == 1;
     fclose(file);
-    const char expected[8] = {'R', 'A', 'C', 'E', 'N', 'N', '4', '\0'};
+    const char expected[8] = {'R', 'A', 'C', 'E', 'N', 'N', '6', '\0'};
     if (!ok || memcmp(magic, expected, sizeof(magic)) != 0 ||
         gene_count != NN_GENOME_COUNT)
     {
@@ -253,6 +299,40 @@ LRESULT CALLBACK window_procedure(
         case 103:
             load_network(application);
             break;
+        case 104:
+            if (training_running || ga_workers_active)
+                break;
+            application->training.start_from_random_weights =
+                !application->training.start_from_random_weights;
+            ga_training.initialized = 0;
+            set_status_message(
+                application,
+                application->training.start_from_random_weights
+                ? "Next training run will use new randomized NN weights."
+                : "Next training run will use the current NN weights.");
+            break;
+        case 105:
+        case 106:
+        case 107:
+            if (training_running || ga_workers_active)
+                break;
+            {
+                TrainingFitnessFunction selected =
+                    (TrainingFitnessFunction)(LOWORD(wparam) - 105);
+                if (application->training.fitness_function != selected) {
+                    application->training.fitness_function = selected;
+                    ga_training.initialized = 0;
+                    const char *fitness_messages[3] = {
+                        "Standard training fitness selected.",
+                        "Corner-exit speed training fitness selected.",
+                        "Adaptive curriculum training fitness selected."
+                    };
+                    set_status_message(
+                        application,
+                        fitness_messages[(int)selected]);
+                }
+            }
+            break;
         default:
             break;
         }
@@ -313,7 +393,8 @@ LRESULT CALLBACK window_procedure(
             int previous_hover = command_hover;
             command_hover = 0;
             int command = right_pane_command_at(&client, x, y);
-            if (command >= 0 && right_pane_command_is_disabled(command))
+            if (command >= 0 && right_pane_command_is_disabled(
+                    command, training_running, ga_workers_active))
                 command = -1;
             if (command >= 0)
                 command_hover = command + 100;
@@ -340,7 +421,8 @@ LRESULT CALLBACK window_procedure(
             int y = (int)(short)HIWORD(lparam);
 
             int command = right_pane_command_at(&client, x, y);
-            if (command >= 0 && right_pane_command_is_disabled(command))
+            if (command >= 0 && right_pane_command_is_disabled(
+                    command, training_running, ga_workers_active))
                 command = -1;
             if (command >= 0)
                 SendMessageA(
@@ -452,6 +534,7 @@ int WINAPI WinMain(
         return 1;
     }
 
+    application->environment.random_state = network_random_seed();
     neural_policy_initialize(
         &application->policy,
         &application->environment.random_state);
@@ -485,7 +568,8 @@ int WINAPI WinMain(
         &application->reward_parameters,
         &application->controller_parameters,
         &application->policy,
-        window);
+        window,
+        application->environment.random_state);
 
     ShowWindow(window, show_command);
     UpdateWindow(window);

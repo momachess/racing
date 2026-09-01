@@ -1,5 +1,10 @@
 #include "racing.h"
 
+#include <random>
+#if defined(RACING_USE_AVX2)
+#include <immintrin.h>
+#endif
+
 #define display_track (*environment->track)
 #define display_car (environment->car)
 #define car_parameters (*environment->parameters)
@@ -21,7 +26,8 @@ void car_parameters_initialize_default(CarParameters *parameters)
     parameters->max_brake_force_n = 18000.0f;
     parameters->rolling_deceleration = 0.35f;
     parameters->aero_deceleration_at_max_speed = 4.0f;
-    parameters->max_lateral_acceleration = 45.0f;
+    parameters->mechanical_lateral_acceleration = 18.0f;
+    parameters->aerodynamic_lateral_acceleration_at_max_speed = 35.0f;
     parameters->half_width = 0.5f;
     parameters->front_offset = 2.75f;
 
@@ -38,7 +44,7 @@ void car_parameters_initialize_default(CarParameters *parameters)
     parameters->lookahead_minimum_distance[1] = 24.0f;
     parameters->lookahead_minimum_distance[2] = 36.0f;
     parameters->lookahead_minimum_distance[3] = 48.0f;
-    parameters->lookahead_curvature_sample_distance = 2.0f;
+    parameters->lookahead_curvature_sample_distance = 10.0f;
     parameters->lookahead_curvature_scale = 50.0f;
 }
 
@@ -46,14 +52,24 @@ void reward_parameters_initialize_default(RewardParameters *parameters)
 {
     memset(parameters, 0, sizeof(*parameters));
     parameters->lap_progress_reward = 10.0f;
-    parameters->time_penalty_per_second = 0.001f;
+    parameters->time_penalty_per_second = 0.02f;
     parameters->pedal_conflict_penalty_per_second = 0.0f;
     parameters->steering_change_penalty = 0.002f;
     parameters->excess_lateral_penalty_per_second = 0.01f;
     parameters->off_track_penalty = 1.0f;
     parameters->stationary_penalty = 1.0f;
     parameters->lap_completion_reward = 5.0f;
-    parameters->lap_speed_reward = 5.0f;
+    parameters->lap_speed_reward = 15.0f;
+    parameters->corner_exit_speed_reward = 0.20f;
+    parameters->corner_exit_zone_length = 50.0f;
+    parameters->corner_exit_curvature_drop_threshold = 0.001f;
+    parameters->corner_exit_minimum_curvature = 0.002f;
+    parameters->corner_exit_speed_gain_scale = 20.0f;
+    parameters->curriculum_progress_scale = 1.5f;
+    parameters->curriculum_incomplete_average_speed_reward = 3.0f;
+    parameters->curriculum_longitudinal_jerk_penalty = 0.0025f;
+    parameters->curriculum_pedal_change_penalty = 0.01f;
+    parameters->curriculum_pedal_conflict_penalty_per_second = 0.05f;
     parameters->stationary_speed_threshold = 1.0f;
     parameters->stationary_timeout = 3.0f;
 }
@@ -203,12 +219,44 @@ float network_random_gaussian(unsigned int *random_state)
 }
 
 
+/* Mechanical grip dominates at low speed. Aerodynamic downforce increases
+   the available lateral acceleration with the square of vehicle speed. */
+static float maximum_lateral_acceleration_at_speed(
+    const CarParameters *parameters,
+    float speed)
+{
+    float maximum_speed = parameters->max_speed_kmh / 3.6f;
+    float speed_ratio = maximum_speed > 0.0f
+        ? fmaxf(0.0f, fminf(speed / maximum_speed, 1.0f))
+        : 0.0f;
+    return fmaxf(
+        parameters->mechanical_lateral_acceleration +
+        parameters->aerodynamic_lateral_acceleration_at_max_speed *
+            speed_ratio * speed_ratio,
+        1e-6f);
+}
+
+
+unsigned int network_random_seed(void)
+{
+    std::random_device entropy;
+    LARGE_INTEGER performance_counter;
+    QueryPerformanceCounter(&performance_counter);
+
+    unsigned int seed = entropy();
+    seed ^= (unsigned int)performance_counter.LowPart;
+    seed ^= (unsigned int)performance_counter.HighPart;
+    seed ^= GetCurrentProcessId() * 0x9e3779b9u;
+    seed ^= (unsigned int)GetTickCount64();
+    return seed;
+}
+
+
 void neural_policy_initialize(
     NeuralPolicy *policy,
     unsigned int *random_state)
 {
     memset(policy, 0, sizeof(*policy));
-    *random_state = 0x6d2b79f5u;
 
     float limit1 = sqrtf(6.0f /
         (NN_INPUT_COUNT + NN_HIDDEN1_COUNT));
@@ -280,6 +328,31 @@ void genome_to_network(
 
 
 Vec2 track_position_at_s(const Track *track, float s);
+float track_heading_at_s(const Track *track, float s);
+float wrap_angle(float angle);
+
+static const float fixed_curvature_distance[
+    FIXED_CURVATURE_INPUT_COUNT] = {10.0f, 25.0f, 50.0f, 100.0f};
+
+
+float track_curvature_at_s(
+    const Track *track,
+    float s,
+    float sample_distance)
+{
+    Vec2 before = track_position_at_s(track, s - sample_distance);
+    Vec2 center = track_position_at_s(track, s);
+    Vec2 after = track_position_at_s(track, s + sample_distance);
+    Vec2 first = vsub(center, before);
+    Vec2 second = vsub(after, center);
+    float chord_length = vlength(vsub(after, before));
+    float denominator = vlength(first) *
+        vlength(second) * chord_length;
+    float cross = first.x * second.y - first.y * second.x;
+    return denominator > 1e-6f
+        ? 2.0f * cross / denominator
+        : 0.0f;
+}
 
 
 float lookahead_distance_for_point(
@@ -292,61 +365,93 @@ float lookahead_distance_for_point(
 }
 
 
+void racing_env_line_telemetry(
+    const RacingEnv *environment,
+    RacingLineTelemetry *telemetry)
+{
+    memset(telemetry, 0, sizeof(*telemetry));
+    Vec2 track_center = track_position_at_s(
+        &display_track, display_car.track_s);
+    float local_track_heading = track_heading_at_s(
+        &display_track, display_car.track_s);
+    Vec2 track_left = vec2(
+        -sinf(local_track_heading),
+        cosf(local_track_heading));
+    telemetry->lateral_offset = vdot(
+        vsub(display_car.position, track_center), track_left);
+    telemetry->heading_error = wrap_angle(
+        display_car.heading - local_track_heading);
+
+    for (int sample = 0; sample < FIXED_CURVATURE_INPUT_COUNT; sample++) {
+        telemetry->fixed_curvature[sample] = track_curvature_at_s(
+            &display_track,
+            display_car.track_s + fixed_curvature_distance[sample],
+            car_parameters.lookahead_curvature_sample_distance);
+    }
+}
+
+
 void racing_env_observe(
     const RacingEnv *environment,
     RacingObservation *observation)
 {
-    float *inputs = observation->values;
     float maximum_speed = car_parameters.max_speed_kmh / 3.6f;
-    inputs[0] = clamp01(display_car.v_x / maximum_speed);
-    inputs[1] = encode_signed_input(
-        display_car.v_y, maximum_speed);
-    inputs[2] = encode_signed_input(
+    observation->normalized_speed =
+        clamp01(display_car.v_x / maximum_speed);
+    observation->encoded_lateral_speed = encode_signed_input(
+        display_car.v_y, NN_LATERAL_SPEED_SCALE_MPS);
+    observation->encoded_steering_angle = encode_signed_input(
         display_car.steering_angle, car_parameters.max_steering_angle);
-    inputs[3] = encode_signed_input(
+    observation->encoded_yaw_rate = encode_signed_input(
         display_car.yaw_rate, car_parameters.max_yaw_rate);
-    inputs[4] = encode_longitudinal_acceleration_input(
-        environment->parameters, display_car.a_x);
-    inputs[5] = encode_signed_input(
-        display_car.a_y, car_parameters.max_lateral_acceleration);
+    observation->encoded_longitudinal_acceleration =
+        encode_longitudinal_acceleration_input(
+            environment->parameters, display_car.a_x);
+    observation->encoded_lateral_acceleration = encode_signed_input(
+        display_car.a_y,
+        maximum_lateral_acceleration_at_speed(
+            environment->parameters, display_car.v_x));
 
-    int history_input = 6;
     for (int step = 0; step < CAR_HISTORY_STEP_COUNT; step++) {
         CarHistorySample sample = {0};
         if (step < environment->history_count)
             sample = environment->history[step];
-        int input = history_input + step * CAR_HISTORY_VALUE_COUNT;
-        inputs[input + 0] = clamp01(sample.v_x / maximum_speed);
-        inputs[input + 1] = encode_signed_input(sample.v_y, maximum_speed);
-        inputs[input + 2] = encode_longitudinal_acceleration_input(
-            environment->parameters, sample.a_x);
-        inputs[input + 3] = encode_signed_input(
-            sample.a_y, car_parameters.max_lateral_acceleration);
-        inputs[input + 4] = encode_signed_input(
+        RacingHistoryObservation *history = &observation->history[step];
+        history->normalized_speed = clamp01(sample.v_x / maximum_speed);
+        history->encoded_lateral_speed =
+            encode_signed_input(sample.v_y, NN_LATERAL_SPEED_SCALE_MPS);
+        history->encoded_longitudinal_acceleration =
+            encode_longitudinal_acceleration_input(
+                environment->parameters, sample.a_x);
+        history->encoded_lateral_acceleration = encode_signed_input(
+            sample.a_y,
+            maximum_lateral_acceleration_at_speed(
+                environment->parameters, sample.v_x));
+        history->encoded_steering_angle = encode_signed_input(
             sample.steering_angle,
             car_parameters.max_steering_angle);
-        inputs[input + 5] = clamp01(sample.throttle);
-        inputs[input + 6] = clamp01(sample.brake);
+        history->normalized_throttle = clamp01(sample.throttle);
+        history->normalized_brake = clamp01(sample.brake);
     }
 
-    int lidar_input = history_input +
-        CAR_HISTORY_STEP_COUNT * CAR_HISTORY_VALUE_COUNT;
     for (int sensor = 0; sensor < MAX_LIDAR_SENSOR_COUNT; sensor++)
-        inputs[lidar_input + sensor] = 1.0f;
+        observation->normalized_lidar_distance[sensor] = 1.0f;
     for (int sensor = 0; sensor < car_parameters.lidar_sensor_count; sensor++)
-        inputs[lidar_input + sensor] = clamp01(
-            display_car.lidar_distance[sensor] / car_parameters.lidar_range);
+        observation->normalized_lidar_distance[sensor] =
+            clamp01(display_car.lidar_distance[sensor] /
+                    car_parameters.lidar_range);
 
     Vec2 forward = vec2(
         cosf(display_car.heading),
         sinf(display_car.heading));
     Vec2 left = vec2(-forward.y, forward.x);
-    int lookahead_input = lidar_input + MAX_LIDAR_SENSOR_COUNT;
     for (int point = 0; point < MAX_LOOKAHEAD_POINT_COUNT; point++) {
-        inputs[lookahead_input + point] = 0.5f;
-        inputs[lookahead_input + MAX_LOOKAHEAD_POINT_COUNT + point] = 0.5f;
-        inputs[lookahead_input + MAX_LOOKAHEAD_POINT_COUNT * 2 + point] = 0.5f;
-        inputs[lookahead_input + MAX_LOOKAHEAD_POINT_COUNT * 3 + point] = 0.5f;
+        RacingLookaheadObservation *lookahead =
+            &observation->lookahead[point];
+        lookahead->encoded_lateral_offset = 0.5f;
+        lookahead->encoded_forward_offset = 0.5f;
+        lookahead->encoded_angle = 0.5f;
+        lookahead->normalized_curvature = 0.5f;
     }
     for (int point = 0; point < car_parameters.lookahead_point_count; point++) {
         float distance = lookahead_distance_for_point(environment, point);
@@ -363,33 +468,125 @@ void racing_env_observe(
             angle_difference += 2.0f * (float)M_PI;
 
         float point_s = display_car.track_s + distance;
-        Vec2 before = track_position_at_s(
+        float curvature = track_curvature_at_s(
             &display_track,
-            point_s - car_parameters.lookahead_curvature_sample_distance);
-        Vec2 center = display_car.lookahead_point[point];
-        Vec2 after = track_position_at_s(
-            &display_track,
-            point_s + car_parameters.lookahead_curvature_sample_distance);
-        Vec2 first = vsub(center, before);
-        Vec2 second = vsub(after, center);
-        float chord_length = vlength(vsub(after, before));
-        float denominator = vlength(first) *
-            vlength(second) * chord_length;
-        float cross = first.x * second.y - first.y * second.x;
-        float curvature = denominator > 1e-6f
-            ? 2.0f * cross / denominator
-            : 0.0f;
+            point_s,
+            car_parameters.lookahead_curvature_sample_distance);
 
-        inputs[lookahead_input + point] = encode_signed_input(
-            lateral_offset, distance);
-        inputs[lookahead_input + MAX_LOOKAHEAD_POINT_COUNT + point] =
+        RacingLookaheadObservation *lookahead =
+            &observation->lookahead[point];
+        lookahead->encoded_lateral_offset =
+            encode_signed_input(lateral_offset, distance);
+        lookahead->encoded_forward_offset =
             encode_signed_input(forward_offset, distance);
-        inputs[lookahead_input + MAX_LOOKAHEAD_POINT_COUNT * 2 + point] =
+        lookahead->encoded_angle =
             encode_signed_input(angle_difference, (float)M_PI);
-        inputs[lookahead_input + MAX_LOOKAHEAD_POINT_COUNT * 3 + point] =
+        lookahead->normalized_curvature =
             clamp01(0.5f + 0.5f * tanhf(
                 curvature * car_parameters.lookahead_curvature_scale));
     }
+
+    RacingLineTelemetry telemetry;
+    racing_env_line_telemetry(environment, &telemetry);
+    float usable_half_width = fmaxf(
+        TRACK_HALF_WIDTH - car_parameters.half_width,
+        1e-6f);
+    observation->encoded_lateral_offset =
+        encode_signed_input(telemetry.lateral_offset, usable_half_width);
+    observation->encoded_heading_error =
+        encode_signed_input(
+            telemetry.heading_error,
+            NN_HEADING_ERROR_SCALE_RADIANS);
+
+    for (int sample = 0; sample < FIXED_CURVATURE_INPUT_COUNT; sample++) {
+        observation->normalized_fixed_curvature[sample] =
+            clamp01(0.5f + 0.5f * tanhf(
+                telemetry.fixed_curvature[sample] *
+                car_parameters.lookahead_curvature_scale));
+    }
+}
+
+
+static void observation_to_nn_inputs(
+    const RacingObservation *observation,
+    float inputs[NN_INPUT_COUNT])
+{
+    int input = 0;
+    inputs[input++] = observation->normalized_speed;
+    inputs[input++] = observation->encoded_lateral_speed;
+    inputs[input++] = observation->encoded_steering_angle;
+    inputs[input++] = observation->encoded_yaw_rate;
+    inputs[input++] = observation->encoded_longitudinal_acceleration;
+    inputs[input++] = observation->encoded_lateral_acceleration;
+
+    for (int step = 0; step < CAR_HISTORY_STEP_COUNT; step++) {
+        const RacingHistoryObservation *history =
+            &observation->history[step];
+        inputs[input++] = history->normalized_speed;
+        inputs[input++] = history->encoded_lateral_speed;
+        inputs[input++] = history->encoded_longitudinal_acceleration;
+        inputs[input++] = history->encoded_lateral_acceleration;
+        inputs[input++] = history->encoded_steering_angle;
+        inputs[input++] = history->normalized_throttle;
+        inputs[input++] = history->normalized_brake;
+    }
+
+    for (int sensor = 0; sensor < MAX_LIDAR_SENSOR_COUNT; sensor++)
+        inputs[input++] = observation->normalized_lidar_distance[sensor];
+
+    /* Preserve the saved-network input layout: lookahead values are stored
+       by feature rather than by point in the flattened NN vector. */
+    for (int point = 0; point < MAX_LOOKAHEAD_POINT_COUNT; point++)
+        inputs[input++] =
+            observation->lookahead[point].encoded_lateral_offset;
+    for (int point = 0; point < MAX_LOOKAHEAD_POINT_COUNT; point++)
+        inputs[input++] =
+            observation->lookahead[point].encoded_forward_offset;
+    for (int point = 0; point < MAX_LOOKAHEAD_POINT_COUNT; point++)
+        inputs[input++] = observation->lookahead[point].encoded_angle;
+    for (int point = 0; point < MAX_LOOKAHEAD_POINT_COUNT; point++)
+        inputs[input++] =
+            observation->lookahead[point].normalized_curvature;
+
+    inputs[input++] = observation->encoded_lateral_offset;
+    inputs[input++] = observation->encoded_heading_error;
+    for (int sample = 0; sample < FIXED_CURVATURE_INPUT_COUNT; sample++)
+        inputs[input++] = observation->normalized_fixed_curvature[sample];
+}
+
+
+template <int value_count>
+static float neural_dot_product(
+    const float *weights,
+    const float *values)
+{
+#if defined(RACING_USE_AVX2)
+    __m256 vector_sum = _mm256_setzero_ps();
+    int value = 0;
+    for (; value + 8 <= value_count; value += 8) {
+        __m256 weight_vector = _mm256_loadu_ps(weights + value);
+        __m256 value_vector = _mm256_loadu_ps(values + value);
+        vector_sum = _mm256_add_ps(
+            vector_sum,
+            _mm256_mul_ps(weight_vector, value_vector));
+    }
+
+    __m128 sum128 = _mm_add_ps(
+        _mm256_castps256_ps128(vector_sum),
+        _mm256_extractf128_ps(vector_sum, 1));
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    float sum = _mm_cvtss_f32(sum128);
+
+    for (; value < value_count; value++)
+        sum += weights[value] * values[value];
+    return sum;
+#else
+    float sum = 0.0f;
+    for (int value = 0; value < value_count; value++)
+        sum += weights[value] * values[value];
+    return sum;
+#endif
 }
 
 
@@ -400,32 +597,30 @@ void neural_policy_predict(
     const VehicleControllerParameters *controller_parameters,
     RacingAction *action)
 {
-    const float *inputs = observation->values;
+    alignas(32) float inputs[NN_INPUT_COUNT];
+    observation_to_nn_inputs(observation, inputs);
     float hidden1[NN_HIDDEN1_COUNT];
     float hidden2[NN_HIDDEN2_COUNT];
 
     for (int neuron = 0; neuron < NN_HIDDEN1_COUNT; neuron++) {
-        float sum = policy->hidden1_bias[neuron];
-        for (int input = 0; input < NN_INPUT_COUNT; input++)
-            sum += policy->hidden1_weights[neuron][input] *
-                inputs[input];
+        float sum = policy->hidden1_bias[neuron] +
+            neural_dot_product<NN_INPUT_COUNT>(
+                policy->hidden1_weights[neuron], inputs);
         hidden1[neuron] = tanhf(sum);
     }
 
     for (int neuron = 0; neuron < NN_HIDDEN2_COUNT; neuron++) {
-        float sum = policy->hidden2_bias[neuron];
-        for (int input = 0; input < NN_HIDDEN1_COUNT; input++)
-            sum += policy->hidden2_weights[neuron][input] *
-                hidden1[input];
+        float sum = policy->hidden2_bias[neuron] +
+            neural_dot_product<NN_HIDDEN1_COUNT>(
+                policy->hidden2_weights[neuron], hidden1);
         hidden2[neuron] = tanhf(sum);
     }
 
     float raw[NN_OUTPUT_COUNT];
     for (int output = 0; output < NN_OUTPUT_COUNT; output++) {
-        raw[output] = policy->output_bias[output];
-        for (int input = 0; input < NN_HIDDEN2_COUNT; input++)
-            raw[output] += policy->output_weights[output][input] *
-                hidden2[input];
+        raw[output] = policy->output_bias[output] +
+            neural_dot_product<NN_HIDDEN2_COUNT>(
+                policy->output_weights[output], hidden2);
     }
 
     float maximum_speed = car_parameters_pointer->max_speed_kmh / 3.6f;
@@ -753,54 +948,56 @@ int load_track_geojson(
    TRACK SAMPLE AT S
    ================================================================ */
 
+static float normalize_track_s(const Track *track, float s)
+{
+    if (track->total_length <= 0.0f)
+        return 0.0f;
+    while (s < 0.0f)
+        s += track->total_length;
+    while (s >= track->total_length)
+        s -= track->total_length;
+    return s;
+}
+
+
+static int track_segment_index_at_s(const Track *track, float s)
+{
+    if (track->point_count <= 1)
+        return 0;
+
+    s = normalize_track_s(track, s);
+    int low = 0;
+    int high = track->point_count;
+    while (low + 1 < high) {
+        int middle = low + (high - low) / 2;
+        if (track->s[middle] <= s)
+            low = middle;
+        else
+            high = middle;
+    }
+    return low;
+}
+
+
 Vec2 track_position_at_s(
     const Track *track,
     float s)
 {
-    while (s < 0.0f)
-        s += track->total_length;
+    if (track->point_count <= 0 || track->total_length <= 0.0f)
+        return vec2(0.0f, 0.0f);
 
-    while (s >= track->total_length)
-        s -= track->total_length;
-
-    int i;
-
-    for (i = 0; i < track->point_count; i++) {
-
-        int j =
-            (i + 1) % track->point_count;
-
-        float start =
-            track->s[i];
-
-        float end;
-
-        if (i == track->point_count - 1)
-            end = track->total_length;
-        else
-            end = track->s[j];
-
-        if (s >= start && s <= end) {
-
-            float length =
-                end - start;
-
-            float t =
-                length > 0.0f
-                ? (s - start) / length
-                : 0.0f;
-
-            return vadd(
-                track->points[i],
-                vmul(
-                    vsub(
-                        track->points[j],
-                        track->points[i]),
-                    t));
-        }
-    }
-
-    return track->points[0];
+    s = normalize_track_s(track, s);
+    int segment = track_segment_index_at_s(track, s);
+    int next = (segment + 1) % track->point_count;
+    float start = track->s[segment];
+    float end = segment == track->point_count - 1
+        ? track->total_length
+        : track->s[next];
+    float length = end - start;
+    float amount = length > 0.0f ? (s - start) / length : 0.0f;
+    return vadd(
+        track->points[segment],
+        vmul(vsub(track->points[next], track->points[segment]), amount));
 }
 
 
@@ -813,10 +1010,12 @@ float track_heading_at_s(
     float s)
 {
     Vec2 p1 =
-        track_position_at_s(track, s);
+        track_position_at_s(
+            track, s - TRACK_HEADING_HALF_SAMPLE_DISTANCE);
 
     Vec2 p2 =
-        track_position_at_s(track, s + 1.0f);
+        track_position_at_s(
+            track, s + TRACK_HEADING_HALF_SAMPLE_DISTANCE);
 
     Vec2 d =
         vsub(p2, p1);
@@ -835,12 +1034,25 @@ float wrap_angle(float angle)
 }
 
 
-float closest_track_s(const Track *track, Vec2 position)
+static float closest_track_s_near(
+    const Track *track,
+    Vec2 position,
+    int center_segment,
+    int *closest_segment)
 {
     float best_distance_squared = FLT_MAX;
     float best_s = 0.0f;
+    int best_segment = center_segment;
 
-    for (int i = 0; i < track->point_count; i++) {
+    for (int offset = -TRACK_CLOSEST_SEGMENT_SEARCH_RADIUS;
+         offset <= TRACK_CLOSEST_SEGMENT_SEARCH_RADIUS;
+         offset++)
+    {
+        int i = center_segment + offset;
+        while (i < 0)
+            i += track->point_count;
+        while (i >= track->point_count)
+            i -= track->point_count;
         int j = (i + 1) % track->point_count;
         Vec2 segment = vsub(track->points[j], track->points[i]);
         float segment_length_squared = vdot(segment, segment);
@@ -856,12 +1068,17 @@ float closest_track_s(const Track *track, Vec2 position)
             vsub(position, nearest));
         if (distance_squared < best_distance_squared) {
             best_distance_squared = distance_squared;
-            best_s = track->s[i] + sqrtf(segment_length_squared) * t;
+            float segment_length = i == track->point_count - 1
+                ? track->total_length - track->s[i]
+                : track->s[i + 1] - track->s[i];
+            best_s = track->s[i] + segment_length * t;
+            best_segment = i;
         }
     }
 
     if (best_s >= track->total_length)
         best_s -= track->total_length;
+    *closest_segment = best_segment;
     return best_s;
 }
 
@@ -1030,6 +1247,11 @@ void racing_env_reset_at(
     memset(&environment->pending_history_sample, 0,
            sizeof(environment->pending_history_sample));
     environment->pending_history_sample_valid = 0;
+    environment->last_step_reward = 0.0f;
+    environment->corner_exit_phase = 0;
+    environment->corner_exit_peak_curvature = 0.0f;
+    environment->corner_exit_apex_speed = 0.0f;
+    environment->corner_exit_distance_from_apex = 0.0f;
     display_car.last_lap = -1.0f;
     display_car.completed_circuit_time = -1.0f;
     for (int sector = 0; sector < TRACK_SECTOR_COUNT; sector++)
@@ -1043,9 +1265,13 @@ void racing_env_reset_at(
     display_car.position = vsub(
         track_position_at_s(&display_track, track_s),
         vmul(forward, car_parameters.front_offset));
-    display_car.track_s = closest_track_s(
+    environment->closest_track_segment = track_segment_index_at_s(
+        &display_track, track_s);
+    display_car.track_s = closest_track_s_near(
         &display_track,
-        display_car.position);
+        display_car.position,
+        environment->closest_track_segment,
+        &environment->closest_track_segment);
     display_car.timing_start_line = timing_start_line;
     display_car.timing_next_line =
         (timing_start_line + 1) % TIMING_LINE_COUNT;
@@ -1401,6 +1627,9 @@ void racing_env_step(
     float previous_track_s = display_car.track_s;
     float previous_command = display_car.steering_command;
     float previous_speed = display_car.v_x;
+    float previous_longitudinal_acceleration = display_car.a_x;
+    float previous_throttle = display_car.throttle;
+    float previous_brake = display_car.brake;
     Vec2 previous_position = display_car.position;
     float previous_heading = display_car.heading;
     float elapsed_before_step = display_car.lap_elapsed;
@@ -1414,7 +1643,7 @@ void racing_env_step(
     float target_steering_angle = display_car.steering_command *
         car_parameters.max_steering_angle;
     float maximum_speed = car_parameters.max_speed_kmh / 3.6f;
-    float peak_a_y_demand = 0.0f;
+    float peak_lateral_overload_ratio = 0.0f;
     float remaining = elapsed;
     while (remaining > 0.0f) {
         float step = fminf(remaining, PHYSICS_MAX_STEP);
@@ -1457,11 +1686,18 @@ void racing_env_step(
         float requested_curvature = tanf(display_car.steering_angle) /
             car_parameters.wheelbase;
         float speed_squared = display_car.v_x * display_car.v_x;
-        peak_a_y_demand = fmaxf(
-            peak_a_y_demand,
-            speed_squared * fabsf(requested_curvature));
+        float requested_lateral_acceleration =
+            speed_squared * fabsf(requested_curvature);
+        float maximum_lateral_acceleration =
+            maximum_lateral_acceleration_at_speed(
+                environment->parameters, display_car.v_x);
+        peak_lateral_overload_ratio = fmaxf(
+            peak_lateral_overload_ratio,
+            fmaxf(requested_lateral_acceleration /
+                      maximum_lateral_acceleration - 1.0f,
+                  0.0f));
         float maximum_curvature = speed_squared > 1e-6f
-            ? car_parameters.max_lateral_acceleration / speed_squared
+            ? maximum_lateral_acceleration / speed_squared
             : fabsf(requested_curvature);
         float effective_curvature = fmaxf(
             -maximum_curvature,
@@ -1497,9 +1733,11 @@ void racing_env_step(
         display_car.yaw_rate = 0.0f;
     }
 
-    display_car.track_s = closest_track_s(
+    display_car.track_s = closest_track_s_near(
         &display_track,
-        display_car.position);
+        display_car.position,
+        environment->closest_track_segment,
+        &environment->closest_track_segment);
 
     Vec2 current_front = vadd(
         display_car.position,
@@ -1541,14 +1779,109 @@ void racing_env_step(
     result->steering_change_penalty =
         -fabsf(display_car.steering_command - previous_command) *
             reward_config.steering_change_penalty;
-    float excess_lateral_acceleration = fmaxf(
-        peak_a_y_demand -
-            car_parameters.max_lateral_acceleration,
-        0.0f);
     result->lateral_acceleration_penalty =
-        -excess_lateral_acceleration /
-        car_parameters.max_lateral_acceleration * elapsed *
-        reward_config.excess_lateral_penalty_per_second;
+        -peak_lateral_overload_ratio * elapsed *
+            reward_config.excess_lateral_penalty_per_second;
+    /* Integrated absolute jerk is the acceleration change over this step.
+       Penalizing its magnitude discourages oscillation without penalizing
+       sustained hard acceleration or braking. */
+    result->longitudinal_jerk_penalty =
+        -fabsf(display_car.a_x - previous_longitudinal_acceleration) *
+            reward_config.curriculum_longitudinal_jerk_penalty;
+    result->pedal_change_penalty =
+        -(fabsf(display_car.throttle - previous_throttle) +
+          fabsf(display_car.brake - previous_brake)) *
+            reward_config.curriculum_pedal_change_penalty;
+    result->curriculum_pedal_conflict_penalty =
+        -display_car.throttle * display_car.brake * elapsed *
+            reward_config.curriculum_pedal_conflict_penalty_per_second;
+    result->corner_exit_speed_reward = 0.0f;
+    if (left_track) {
+        /* A corner earns nothing unless the car remains on track through the
+           complete apex-to-exit measurement zone. */
+        environment->corner_exit_phase = 0;
+        environment->corner_exit_peak_curvature = 0.0f;
+        environment->corner_exit_apex_speed = 0.0f;
+        environment->corner_exit_distance_from_apex = 0.0f;
+    } else if (progress > 0.0f &&
+               reward_config.corner_exit_zone_length > 0.0f &&
+               reward_config.corner_exit_curvature_drop_threshold > 0.0f &&
+               reward_config.corner_exit_speed_gain_scale > 0.0f) {
+        float current_curvature = fabsf(track_curvature_at_s(
+            &display_track,
+            display_car.track_s,
+            car_parameters.lookahead_curvature_sample_distance));
+
+        if (environment->corner_exit_phase == 0 &&
+            current_curvature >= reward_config.corner_exit_minimum_curvature) {
+            environment->corner_exit_phase = 1;
+            environment->corner_exit_peak_curvature = current_curvature;
+            environment->corner_exit_apex_speed = display_car.v_x;
+            environment->corner_exit_distance_from_apex = 0.0f;
+        } else if (environment->corner_exit_phase == 1) {
+            if (current_curvature >
+                environment->corner_exit_peak_curvature) {
+                /* The geometric apex is the greatest curvature reached in
+                   this corner. Keep its speed and restart the exit distance. */
+                environment->corner_exit_peak_curvature = current_curvature;
+                environment->corner_exit_apex_speed = display_car.v_x;
+                environment->corner_exit_distance_from_apex = 0.0f;
+            } else {
+                environment->corner_exit_distance_from_apex += progress;
+                if (environment->corner_exit_peak_curvature -
+                        current_curvature >=
+                    reward_config.corner_exit_curvature_drop_threshold) {
+                    environment->corner_exit_phase = 2;
+                }
+            }
+        } else if (environment->corner_exit_phase == 2) {
+            /* If a compound corner tightens again, move the apex forward
+               instead of rewarding an intermediate bend as a full exit. */
+            if (current_curvature >
+                environment->corner_exit_peak_curvature) {
+                environment->corner_exit_phase = 1;
+                environment->corner_exit_peak_curvature = current_curvature;
+                environment->corner_exit_apex_speed = display_car.v_x;
+                environment->corner_exit_distance_from_apex = 0.0f;
+            } else {
+                environment->corner_exit_distance_from_apex += progress;
+            }
+
+            if (environment->corner_exit_phase == 2 &&
+                environment->corner_exit_distance_from_apex >=
+                    reward_config.corner_exit_zone_length) {
+                /* One bounded reward per corner. Absolute exit speed rewards
+                   carrying momentum; speed gain rewards acceleration from the
+                   measured apex. Waiting for the full zone makes an off-track
+                   excursion before this point cancel the event. */
+                float maximum_speed =
+                    car_parameters.max_speed_kmh / 3.6f;
+                float exit_speed_ratio = maximum_speed > 0.0f
+                    ? clamp01(display_car.v_x / maximum_speed)
+                    : 0.0f;
+                float speed_gain_ratio = clamp01(
+                    (display_car.v_x -
+                     environment->corner_exit_apex_speed) /
+                    reward_config.corner_exit_speed_gain_scale);
+                float exit_score =
+                    0.5f * exit_speed_ratio * exit_speed_ratio +
+                    0.5f * speed_gain_ratio;
+
+                result->corner_exit_speed_reward =
+                    reward_config.corner_exit_speed_reward *
+                    clamp01(exit_score);
+                environment->corner_exit_phase = 3;
+            }
+        } else if (current_curvature <
+                   reward_config.corner_exit_minimum_curvature) {
+            /* Re-arm only after leaving the rewarded corner, preventing one
+               long exit from producing several rewards. */
+            environment->corner_exit_phase = 0;
+            environment->corner_exit_peak_curvature = 0.0f;
+            environment->corner_exit_apex_speed = 0.0f;
+            environment->corner_exit_distance_from_apex = 0.0f;
+        }
+    }
 
     if (display_car.v_x < reward_config.stationary_speed_threshold)
         environment->stationary_elapsed += elapsed;
@@ -1585,6 +1918,7 @@ void racing_env_step(
         result->steering_change_penalty +
         result->lateral_acceleration_penalty +
         result->terminal_reward;
+    environment->last_step_reward = result->reward;
     racing_env_update_history(
         environment, &previous_history_sample, elapsed);
     racing_env_observe(environment, &result->observation);

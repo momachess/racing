@@ -618,6 +618,125 @@ void draw_d2d_pane_text(
             brush);
 }
 
+
+void update_run_chart(
+    RendererContext *renderer,
+    const RacingEnv *environment,
+    int animation_running,
+    int training_is_running)
+{
+    int sampling = animation_running && !training_is_running;
+    if (!sampling) {
+        renderer->run_chart_sampling = 0;
+        return;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    if (!renderer->run_chart_sampling) {
+        renderer->run_chart_sample_count = 0;
+        renderer->run_chart_next_sample = 0;
+        renderer->run_chart_last_sample_tick = now;
+        renderer->run_chart_sampling = 1;
+    } else if (now - renderer->run_chart_last_sample_tick <
+               RUN_CHART_SAMPLE_INTERVAL_MS)
+    {
+        return;
+    } else {
+        renderer->run_chart_last_sample_tick = now;
+    }
+
+    RunChartSample *sample =
+        &renderer->run_chart_samples[renderer->run_chart_next_sample];
+    sample->speed_kmh = display_car.v_x * 3.6f;
+    sample->acceleration = display_car.a_x;
+    renderer->run_chart_next_sample =
+        (renderer->run_chart_next_sample + 1) % RUN_CHART_SAMPLE_COUNT;
+    if (renderer->run_chart_sample_count < RUN_CHART_SAMPLE_COUNT)
+        renderer->run_chart_sample_count++;
+}
+
+
+void draw_run_chart(
+    RendererContext *renderer,
+    const RacingEnv *environment,
+    float left,
+    float top,
+    float right,
+    float bottom)
+{
+    if (bottom - top < 70.0f)
+        return;
+
+    char speed_legend[48];
+    char acceleration_legend[48];
+    snprintf(speed_legend, sizeof(speed_legend),
+             "Speed %.0f km/h", display_car.v_x * 3.6f);
+    snprintf(acceleration_legend, sizeof(acceleration_legend),
+             "Accel %+.1f m/s2", display_car.a_x);
+    draw_d2d_pane_text(renderer, speed_legend,
+                       left, top, (right - left) * 0.52f, 20.0f,
+                       d2d_blue_brush);
+    draw_d2d_pane_text(renderer, acceleration_legend,
+                       left + (right - left) * 0.52f, top,
+                       (right - left) * 0.48f, 20.0f,
+                       d2d_red_brush);
+
+    D2D1_RECT_F plot = D2D1::RectF(left, top + 22.0f, right, bottom);
+    d2d_target->FillRectangle(plot, d2d_command_brush);
+    for (int grid = 1; grid < 4; grid++) {
+        float y = plot.top + (plot.bottom - plot.top) * grid / 4.0f;
+        d2d_target->DrawLine(
+            D2D1::Point2F(plot.left, y),
+            D2D1::Point2F(plot.right, y),
+            d2d_pane_border_brush,
+            grid == 2 ? 1.0f : 0.5f);
+    }
+    d2d_target->DrawRectangle(plot, d2d_pane_border_brush, 1.0f);
+
+    int count = renderer->run_chart_sample_count;
+    if (count < 2)
+        return;
+
+    int oldest = renderer->run_chart_next_sample - count;
+    if (oldest < 0)
+        oldest += RUN_CHART_SAMPLE_COUNT;
+    float speed_scale = fmaxf(car_parameters.max_speed_kmh, 1.0f);
+    D2D1_POINT_2F previous_speed = {};
+    D2D1_POINT_2F previous_acceleration = {};
+    for (int point = 0; point < count; point++) {
+        int sample_index = (oldest + point) % RUN_CHART_SAMPLE_COUNT;
+        const RunChartSample *sample =
+            &renderer->run_chart_samples[sample_index];
+        float x = plot.left + (plot.right - plot.left) *
+            point / (float)(count - 1);
+        float speed_amount = fmaxf(
+            0.0f, fminf(sample->speed_kmh / speed_scale, 1.0f));
+        float acceleration_amount = fmaxf(
+            -1.0f,
+            fminf(sample->acceleration /
+                      RUN_CHART_ACCELERATION_RANGE,
+                  1.0f));
+        D2D1_POINT_2F speed_point = D2D1::Point2F(
+            x,
+            plot.bottom - speed_amount * (plot.bottom - plot.top));
+        D2D1_POINT_2F acceleration_point = D2D1::Point2F(
+            x,
+            (plot.top + plot.bottom) * 0.5f -
+                acceleration_amount * (plot.bottom - plot.top) * 0.5f);
+        if (point > 0) {
+            d2d_target->DrawLine(
+                previous_speed, speed_point, d2d_blue_brush, 1.75f);
+            d2d_target->DrawLine(
+                previous_acceleration,
+                acceleration_point,
+                d2d_red_brush,
+                1.5f);
+        }
+        previous_speed = speed_point;
+        previous_acceleration = acceleration_point;
+    }
+}
+
 void draw_d2d_button_text(
     RendererContext *renderer,
     const char *text,
@@ -747,6 +866,12 @@ int render_direct2d(
 
     if (client.right <= 0 || client.bottom <= 0)
         return 1;
+
+    update_run_chart(
+        renderer,
+        environment,
+        animation_running,
+        training_running);
 
     TrackRenderView view = make_track_render_view(
         renderer,
@@ -1007,19 +1132,25 @@ int render_direct2d(
     char brake_text[32];
     char steering_command_text[32];
     char desired_speed_text[32];
+    char actual_lateral_offset_text[32];
     char desired_lateral_offset_text[32];
+    char heading_error_text[32];
     char desired_heading_offset_text[32];
+    char upcoming_curvature_text[32];
+    char step_reward_text[32];
     char generation_text[32];
+    char generation_elapsed_text[32];
     char population_text[32];
     char best_fitness_text[32];
     char average_fitness_text[32];
     char best_average_speed_text[32];
-    char best_track_progress_text[32];
+    char best_top_speed_text[32];
     char average_progress_reward_text[32];
     char average_control_penalty_text[32];
     char off_track_text[32];
-    char stationary_text[32];
     char lap_completion_text[32];
+    char median_progress_text[32];
+    char curriculum_blend_text[32];
     format_lap_time(
         display_car.lap_elapsed,
         current_lap_text,
@@ -1058,16 +1189,39 @@ int render_direct2d(
              "%+.3f", display_car.steering_command);
     snprintf(desired_speed_text, sizeof(desired_speed_text),
              "%.1f km/h", display_car.desired_speed * 3.6f);
+    RacingLineTelemetry line_telemetry;
+    racing_env_line_telemetry(environment, &line_telemetry);
+    snprintf(actual_lateral_offset_text,
+             sizeof(actual_lateral_offset_text),
+             "%+.2f m", line_telemetry.lateral_offset);
     snprintf(desired_lateral_offset_text,
              sizeof(desired_lateral_offset_text),
              "%+.2f m", display_car.desired_lateral_offset);
+    snprintf(heading_error_text, sizeof(heading_error_text),
+             "%+.1f deg", line_telemetry.heading_error *
+                 180.0f / (float)M_PI);
     snprintf(desired_heading_offset_text,
              sizeof(desired_heading_offset_text),
              "%+.1f deg",
              display_car.desired_heading_offset *
                  180.0f / (float)M_PI);
+    snprintf(upcoming_curvature_text,
+             sizeof(upcoming_curvature_text),
+             "%+.4f 1/m", line_telemetry.fixed_curvature[1]);
+    snprintf(step_reward_text, sizeof(step_reward_text),
+             "%+.5f", environment->last_step_reward);
     snprintf(generation_text, sizeof(generation_text),
              "%d", ga_training.completed_generations);
+    unsigned long long generation_elapsed_tenths =
+        (unsigned long long)(
+            ga_training.reported_generation_elapsed_seconds * 10.0f);
+    snprintf(
+        generation_elapsed_text,
+        sizeof(generation_elapsed_text),
+        "%llu:%02llu.%llu",
+        generation_elapsed_tenths / 600,
+        (generation_elapsed_tenths / 10) % 60,
+        generation_elapsed_tenths % 10);
     snprintf(population_text, sizeof(population_text),
              "%d", GA_POPULATION_SIZE);
     if (ga_training.completed_generations > 0) {
@@ -1078,9 +1232,9 @@ int render_direct2d(
         snprintf(best_average_speed_text,
                  sizeof(best_average_speed_text),
                  "%.1f km/h", ga_training.reported_best_average_speed);
-        snprintf(best_track_progress_text,
-                 sizeof(best_track_progress_text),
-                 "%.1f%%", ga_training.reported_best_track_progress);
+        snprintf(best_top_speed_text,
+                 sizeof(best_top_speed_text),
+                 "%.1f km/h", ga_training.reported_best_top_speed);
         snprintf(average_progress_reward_text,
                  sizeof(average_progress_reward_text),
                  "%.3f", ga_training.reported_average_progress_reward);
@@ -1089,43 +1243,55 @@ int render_direct2d(
                  "%.3f", ga_training.reported_average_control_penalty);
         snprintf(off_track_text, sizeof(off_track_text),
                  "%.1f%%", ga_training.reported_off_track_percentage);
-        snprintf(stationary_text, sizeof(stationary_text),
-                 "%.1f%%", ga_training.reported_stationary_percentage);
         snprintf(lap_completion_text, sizeof(lap_completion_text),
                  "%.1f%%",
                  ga_training.reported_lap_completion_percentage);
+        if (training->fitness_function == TRAINING_FITNESS_CURRICULUM) {
+            snprintf(median_progress_text, sizeof(median_progress_text),
+                     "%.1f%%", ga_training.reported_median_track_progress);
+        } else {
+            snprintf(median_progress_text,
+                     sizeof(median_progress_text), "--");
+        }
     } else {
         snprintf(best_fitness_text, sizeof(best_fitness_text), "--");
         snprintf(average_fitness_text, sizeof(average_fitness_text), "--");
         snprintf(best_average_speed_text,
                  sizeof(best_average_speed_text), "--");
-        snprintf(best_track_progress_text,
-                 sizeof(best_track_progress_text), "--");
+        snprintf(best_top_speed_text,
+                 sizeof(best_top_speed_text), "--");
         snprintf(average_progress_reward_text,
                  sizeof(average_progress_reward_text), "--");
         snprintf(average_control_penalty_text,
                  sizeof(average_control_penalty_text), "--");
         snprintf(off_track_text, sizeof(off_track_text), "--");
-        snprintf(stationary_text, sizeof(stationary_text), "--");
         snprintf(lap_completion_text, sizeof(lap_completion_text), "--");
+        snprintf(median_progress_text, sizeof(median_progress_text), "--");
     }
+    snprintf(curriculum_blend_text, sizeof(curriculum_blend_text),
+             training->fitness_function == TRAINING_FITNESS_CURRICULUM
+                 ? "%.0f%%" : "--",
+             training->curriculum_performance_blend * 100.0f);
 
     float result_left = split + 40.0f;
     float result_right = (float)client.right - 40.0f;
     float result_y = 82.0f;
     if (training_running) {
         const char *train_labels[] = {
-            "Generations", "Population", "Best fitness",
-            "Average fitness", "Start avg speed", "Start progress",
+            "Generations", "Generation elapsed", "Population", "Best fitness",
+            "Average fitness", "Avg speed", "Top speed",
             "Mean progress reward", "Mean control penalty",
-            "Off-track", "Stationary", "Lap completion" };
+            "Off-track", "Lap completion", "Median progress",
+            "Performance blend" };
         const char *train_values[] = {
-            generation_text, population_text, best_fitness_text,
+            generation_text, generation_elapsed_text,
+            population_text, best_fitness_text,
             average_fitness_text, best_average_speed_text,
-            best_track_progress_text, average_progress_reward_text,
+            best_top_speed_text, average_progress_reward_text,
             average_control_penalty_text, off_track_text,
-            stationary_text, lap_completion_text };
-        for (int row = 0; row < 11; row++) {
+            lap_completion_text, median_progress_text,
+            curriculum_blend_text };
+        for (int row = 0; row < 13; row++) {
             draw_d2d_pane_text(renderer, train_labels[row], result_left, result_y,
                                result_right - result_left, 22.0f,
                                d2d_pane_label_brush);
@@ -1135,17 +1301,20 @@ int render_direct2d(
         }
     } else {
         const char *run_labels[] = {
-            "Speed", "Target speed", "Target lateral", "Target heading",
+            "Speed", "Target speed", "Actual lateral", "Target lateral",
+            "Heading error", "Target heading", "Curve at 25 m", "Step reward",
             "Controller throttle", "Controller brake", "Controller steering",
             "Current lap", "Split Time 1", "Split Time 2",
             "Last lap", "Laps" };
         const char *run_values[] = {
             speed_value_text, desired_speed_text,
-            desired_lateral_offset_text, desired_heading_offset_text,
+            actual_lateral_offset_text, desired_lateral_offset_text,
+            heading_error_text, desired_heading_offset_text,
+            upcoming_curvature_text, step_reward_text,
             throttle_text, brake_text, steering_command_text,
             current_lap_text, split_time_1_text,
             split_time_2_text, last_lap_text, lap_count_text };
-        for (int row = 0; row < 12; row++) {
+        for (int row = 0; row < 16; row++) {
             draw_d2d_pane_text(renderer, run_labels[row], result_left, result_y,
                                result_right - result_left, 22.0f,
                                d2d_pane_label_brush);
@@ -1155,19 +1324,115 @@ int render_direct2d(
         }
     }
 
+    float command_y = (float)(client.bottom - 60);
+    float source_y = command_y -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
+    float fitness_y = source_y -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_FITNESS_BUTTON_HEIGHT;
+    if (!training_running) {
+        float chart_bottom = fitness_y - 14.0f;
+        float chart_top = fmaxf(result_y + 8.0f, chart_bottom - 200.0f);
+        draw_run_chart(
+            renderer,
+            environment,
+            result_left,
+            chart_top,
+            result_right,
+            chart_bottom);
+    }
+
+    const char *fitness_labels[3] = {
+        "Standard",
+        "Corner exit",
+        "Curriculum"
+    };
+    float fitness_group_width =
+        RIGHT_PANE_FITNESS_BUTTON_WIDTH * 3.0f +
+        RIGHT_PANE_FITNESS_BUTTON_GAP * 2.0f;
+    float fitness_left = split +
+        ((float)RIGHT_PANE_WIDTH - fitness_group_width) * 0.5f;
+    for (int fitness = 0; fitness < 3; fitness++) {
+        int command = 5 + fitness;
+        int disabled = right_pane_command_is_disabled(
+            command, training_running, training->workers_active);
+        int selected = training->fitness_function ==
+            (TrainingFitnessFunction)fitness;
+        float x = fitness_left + fitness *
+            (RIGHT_PANE_FITNESS_BUTTON_WIDTH +
+             RIGHT_PANE_FITNESS_BUTTON_GAP);
+        D2D1_RECT_F rectangle = D2D1::RectF(
+            x,
+            fitness_y,
+            x + RIGHT_PANE_FITNESS_BUTTON_WIDTH,
+            fitness_y + RIGHT_PANE_FITNESS_BUTTON_HEIGHT);
+        d2d_target->FillRectangle(
+            rectangle,
+            selected
+                ? d2d_blue_brush
+                : disabled
+                    ? d2d_pane_background_brush
+                    : command_hover == command + 100
+                        ? d2d_command_hover_brush
+                        : d2d_command_brush);
+        d2d_target->DrawRectangle(
+            rectangle,
+            selected ? d2d_white_brush : d2d_pane_border_brush,
+            selected ? 2.0f : 1.0f);
+        draw_d2d_button_text(
+            renderer,
+            fitness_labels[fitness],
+            &rectangle,
+            selected
+                ? d2d_white_brush
+                : disabled
+                ? d2d_pane_label_brush
+                : d2d_pane_value_brush);
+    }
+
+    float source_left = split +
+        ((float)RIGHT_PANE_WIDTH - RIGHT_PANE_TRAIN_SOURCE_WIDTH) * 0.5f;
+    D2D1_RECT_F source_rect = D2D1::RectF(
+        source_left,
+        source_y,
+        source_left + RIGHT_PANE_TRAIN_SOURCE_WIDTH,
+        source_y + RIGHT_PANE_TRAIN_SOURCE_HEIGHT);
+    int source_disabled = right_pane_command_is_disabled(
+        4, training_running, training->workers_active);
+    d2d_target->FillRectangle(
+        source_rect,
+        source_disabled
+            ? d2d_pane_background_brush
+            : command_hover == 104
+                ? d2d_command_hover_brush
+                : d2d_command_brush);
+    d2d_target->DrawRectangle(
+        source_rect, d2d_pane_border_brush, 1.0f);
+    draw_d2d_button_text(
+        renderer,
+        training->start_from_random_weights
+            ? "Seed: New random NN"
+            : "Seed: Current NN",
+        &source_rect,
+        source_disabled
+            ? d2d_pane_label_brush
+            : d2d_pane_value_brush);
+
     const char *labels[4] = {
         training_running ? "Stop" : "Train",
         animation_running ? "Stop" : "Run",
         "Save",
         "Load"
-    };    float command_y = (float)(client.bottom - 60);
+    };
     float command_group_width =
         RIGHT_PANE_BUTTON_WIDTH * 4.0f +
         RIGHT_PANE_BUTTON_GAP * 3.0f;
     float command_left = split +
         ((float)RIGHT_PANE_WIDTH - command_group_width) * 0.5f;
     for (int command = 0; command < 4; command++) {
-        int disabled = right_pane_command_is_disabled(command);
+        int disabled = right_pane_command_is_disabled(
+            command, training_running, training->workers_active);
         float x = command_left + command *
             (RIGHT_PANE_BUTTON_WIDTH + RIGHT_PANE_BUTTON_GAP);
         D2D1_RECT_F rect = D2D1::RectF(
