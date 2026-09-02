@@ -145,13 +145,19 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="car.cpp" />
+    <ClCompile Include="geometry.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="rendering.cpp" />
     <ClCompile Include="simulation.cpp" />
+    <ClCompile Include="track.cpp" />
     <ClCompile Include="training.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="car.h" />
+    <ClInclude Include="geometry.h" />
     <ClInclude Include="racing.h" />
+    <ClInclude Include="track.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

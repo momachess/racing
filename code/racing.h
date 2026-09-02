@@ -57,12 +57,15 @@
 #define NN_HEADING_ERROR_SCALE_RADIANS ((float)M_PI * 0.25f)
 #define GA_POPULATION_SIZE 64
 #define GA_RESERVED_PROCESSOR_COUNT 2
-#define GA_ELITE_COUNT 4
 #define GA_MAX_EPISODE_STEPS 12000
 #define GA_START_POSITION_COUNT 3
-#define GA_MUTATION_PROBABILITY 0.10f
-#define GA_MUTATION_SCALE 0.05f
 #define GA_FIXED_STEP (1.0f / 60.0f)
+#define ES_PERTURBATION_STDDEV 0.05f
+#define ES_LEARNING_RATE 0.01f
+#define ES_ADAM_BETA1 0.9f
+#define ES_ADAM_BETA2 0.999f
+#define ES_ADAM_EPSILON 1e-8f
+#define TRAINING_TREND_HISTORY_COUNT 30
 #define WM_GA_GENERATION_COMPLETE (WM_APP + 1)
 
 static_assert(
@@ -72,8 +75,12 @@ static_assert(
         NN_OUTPUT_COUNT * NN_HIDDEN2_COUNT + NN_OUTPUT_COUNT,
     "NN_GENOME_COUNT must match the neural-network topology");
 
-#define MAX_TRACK_POINTS 512
-#define MAX_BOUNDARY_POINTS (MAX_TRACK_POINTS * 2)
+static_assert(
+    GA_POPULATION_SIZE % 2 == 0,
+    "Mirrored ES requires an even population size");
+
+#include "track.h"
+
 #define RIGHT_PANE_WIDTH 384
 #define RIGHT_PANE_BUTTON_WIDTH 80
 #define RIGHT_PANE_BUTTON_HEIGHT 36
@@ -84,93 +91,16 @@ static_assert(
 #define RIGHT_PANE_FITNESS_BUTTON_WIDTH 112
 #define RIGHT_PANE_FITNESS_BUTTON_HEIGHT 28
 #define RIGHT_PANE_FITNESS_BUTTON_GAP 8
+#define TRACK_POINT_PICK_RADIUS 12.0f
 #define RUN_CHART_SAMPLE_COUNT 300
 #define RUN_CHART_SAMPLE_INTERVAL_MS 100
 #define RUN_CHART_ACCELERATION_RANGE 20.0f
-
-#define TRACK_HALF_WIDTH 7.0f
-#define TRACK_HEADING_HALF_SAMPLE_DISTANCE 5.0f
-#define TRACK_CLOSEST_SEGMENT_SEARCH_RADIUS 3
-#define TRACK_START_POINT_INDEX 70
-#define TRACK_SECTOR1_POINT_INDEX 106
-#define TRACK_SECTOR2_POINT_INDEX 33
-#define TRACK_SECTOR_COUNT 2
-#define TIMING_LINE_START_FINISH 0
-#define TIMING_LINE_SECTOR1 1
-#define TIMING_LINE_SECTOR2 2
-#define TIMING_LINE_COUNT 3
-
 
 /* ================================================================
    BASIC TYPES
    ================================================================ */
 
-typedef struct {
-    float x;
-    float y;
-} Vec2;
-
-typedef struct {
-    Vec2 start;
-    Vec2 end;
-} BorderSegment;
-
-typedef struct {
-
-    Vec2 points[MAX_TRACK_POINTS];
-    BorderSegment left_boundary[MAX_BOUNDARY_POINTS];
-    BorderSegment right_boundary[MAX_BOUNDARY_POINTS];
-    Vec2 boundary_polygon[MAX_BOUNDARY_POINTS * 2];
-
-    int point_count;
-    int left_boundary_count;
-    int right_boundary_count;
-    int boundary_count;
-
-    Vec2 finish_line_start;
-    Vec2 finish_line_end;
-    int has_finish_line;
-
-    Vec2 sector_line_start[TRACK_SECTOR_COUNT];
-    Vec2 sector_line_end[TRACK_SECTOR_COUNT];
-    float sector_s[TRACK_SECTOR_COUNT];
-    int has_sectors;
-
-    /* cumulative distance around track */
-    float s[MAX_TRACK_POINTS];
-
-    float total_length;
-
-} Track;
-
-typedef struct {
-    float max_speed_kmh;
-    float wheelbase;
-    float max_steering_angle;
-    float max_steering_rate;
-    float max_yaw_rate;
-    float mass_kg;
-    float max_engine_force_n;
-    float max_engine_power_w;
-    float engine_power_speed_floor;
-    float max_brake_force_n;
-    float rolling_deceleration;
-    float aero_deceleration_at_max_speed;
-    float mechanical_lateral_acceleration;
-    float aerodynamic_lateral_acceleration_at_max_speed;
-    float half_width;
-    float front_offset;
-
-    int lidar_sensor_count;
-    float lidar_angle_step_degrees;
-    float lidar_range;
-
-    int lookahead_point_count;
-    float lookahead_time[MAX_LOOKAHEAD_POINT_COUNT];
-    float lookahead_minimum_distance[MAX_LOOKAHEAD_POINT_COUNT];
-    float lookahead_curvature_sample_distance;
-    float lookahead_curvature_scale;
-} CarParameters;
+#include "car.h"
 
 typedef struct {
     float lap_progress_reward;
@@ -197,59 +127,6 @@ typedef struct {
 } RewardParameters;
 
 typedef struct {
-    float maximum_lateral_offset;
-    float maximum_heading_offset;
-    float target_filter_time_constant;
-    float speed_proportional_gain;
-    float speed_integral_gain;
-    float speed_integral_limit;
-    float lateral_error_gain;
-    float lateral_softening_speed;
-    float heading_error_gain;
-    float track_heading_lookahead_time;
-    float track_heading_minimum_lookahead;
-} VehicleControllerParameters;
-
-typedef struct {
-    float v_x;
-    float v_y;
-    float a_x;
-    float a_y;
-    float steering_angle;
-    float throttle;
-    float brake;
-} CarHistorySample;
-
-typedef struct {
-    Vec2 position;
-    float heading;
-    float v_x;
-    float v_y;
-    float a_x;
-    float a_y;
-    float steering_angle;
-    float yaw_rate;
-    float throttle;
-    float brake;
-    float steering_command;
-    float desired_speed;
-    float desired_lateral_offset;
-    float desired_heading_offset;
-    float track_s;
-    float lap_elapsed;
-    float last_lap;
-    float split_time[TRACK_SECTOR_COUNT];
-    int lap_count;
-    int timing_start_line;
-    int timing_next_line;
-    int timing_crossing_count;
-    int circuit_completed_this_step;
-    float completed_circuit_time;
-    float lidar_distance[MAX_LIDAR_SENSOR_COUNT];
-    Vec2 lookahead_point[MAX_LOOKAHEAD_POINT_COUNT];
-} CarState;
-
-typedef struct {
     float hidden1_weights[NN_HIDDEN1_COUNT][NN_INPUT_COUNT];
     float hidden1_bias[NN_HIDDEN1_COUNT];
     float hidden2_weights[NN_HIDDEN2_COUNT][NN_HIDDEN1_COUNT];
@@ -258,7 +135,7 @@ typedef struct {
     float output_bias[NN_OUTPUT_COUNT];
 } NeuralPolicy;
 
-typedef struct {
+typedef struct RacingEnv {
     const Track *track;
     const CarParameters *parameters;
     const RewardParameters *reward_parameters;
@@ -290,7 +167,7 @@ typedef struct {
     float fixed_curvature[FIXED_CURVATURE_INPUT_COUNT];
 } RacingLineTelemetry;
 
-typedef struct {
+typedef struct RacingAction {
     float desired_speed;
     float desired_lateral_offset;
     float desired_heading_offset;
@@ -368,6 +245,8 @@ typedef struct {
     const NeuralPolicy *policy;
     TrainingFitnessFunction fitness_function;
     float curriculum_performance_blend;
+    int use_track_segment;
+    float track_segment_length;
 } EpisodeEvaluator;
 
 typedef struct {
@@ -393,6 +272,17 @@ typedef struct {
 } Genome;
 
 typedef struct {
+    float average_fitness;
+    float average_speed;
+    float average_progress_reward;
+    float average_control_penalty;
+    float off_track_percentage;
+    float lap_completion_percentage;
+    float median_track_progress;
+    float performance_blend;
+} TrainingGenerationSample;
+
+typedef struct {
     int initialized;
     int generation;
     float best_fitness;
@@ -409,6 +299,9 @@ typedef struct {
     float reported_median_track_progress;
     float reported_generation_elapsed_seconds;
     int completed_generations;
+    TrainingGenerationSample history[TRAINING_TREND_HISTORY_COUNT];
+    int history_count;
+    int history_next;
 } GeneticTraining;
 
 typedef struct TrainingContext TrainingContext;
@@ -446,8 +339,11 @@ struct TrainingContext {
     HWND completion_window;
     unsigned int random_state;
     Genome population[GA_POPULATION_SIZE];
-    Genome next_population[GA_POPULATION_SIZE];
     Genome best_genome;
+    float es_mean[NN_GENOME_COUNT];
+    float es_adam_first_moment[NN_GENOME_COUNT];
+    float es_adam_second_moment[NN_GENOME_COUNT];
+    unsigned int es_optimizer_step;
     GeneticTraining metrics;
     PTP_POOL thread_pool;
     TP_CALLBACK_ENVIRON callback_environment;
@@ -463,6 +359,15 @@ struct TrainingContext {
     int discard_active_batch;
     int start_from_random_weights;
     TrainingFitnessFunction fitness_function;
+    int use_track_segment;
+    int track_segment_start_geojson_index;
+    int track_segment_end_geojson_index;
+    float track_segment_start_s;
+    float track_segment_length;
+    int track_segment_selection_stage;
+    int track_segment_hover_geojson_index;
+    int render_car_during_training;
+    float training_preview_forward_progress;
     float curriculum_performance_blend;
     float curriculum_progress_ema;
     float curriculum_completion_ema;
@@ -496,6 +401,8 @@ typedef struct {
     ID2D1SolidColorBrush *d2d_car_brush;
     ID2D1SolidColorBrush *d2d_blue_brush;
     ID2D1SolidColorBrush *d2d_red_brush;
+    ID2D1SolidColorBrush *d2d_green_brush;
+    ID2D1SolidColorBrush *d2d_amber_brush;
     ID2D1SolidColorBrush *d2d_tick_brush;
     ID2D1SolidColorBrush *d2d_gauge_text_brush;
     ID2D1SolidColorBrush *d2d_command_brush;
@@ -530,8 +437,6 @@ typedef struct {
 } RendererContext;
 
 typedef struct {
-    HWND window;
-    char status_message[256];
     Track track;
     CarParameters car_parameters;
     RewardParameters reward_parameters;
@@ -555,26 +460,21 @@ typedef struct {
 
 /* Shared state declarations used while the procedural modules are
    orchestrated by the application layer. */
-void set_status_message(ApplicationContext *application, const char *text);
 void format_lap_time(float seconds, char *text, size_t text_size);
 int right_pane_command_at(const RECT *client, int x, int y);
 int right_pane_command_is_disabled(
     int command,
     int training_is_running,
     int workers_are_active);
+int track_geojson_point_near_screen(
+    const RendererContext *renderer,
+    const Track *track,
+    const RECT *client,
+    int screen_x,
+    int screen_y,
+    float maximum_distance);
 
-Vec2 vec2(float x, float y);
-Vec2 vadd(Vec2 a, Vec2 b);
-Vec2 vsub(Vec2 a, Vec2 b);
-Vec2 vmul(Vec2 a, float scalar);
-float vdot(Vec2 a, Vec2 b);
-float vlength(Vec2 a);
-Vec2 vnormalize(Vec2 a);
-
-void car_parameters_initialize_default(CarParameters *parameters);
 void reward_parameters_initialize_default(RewardParameters *parameters);
-void vehicle_controller_parameters_initialize_default(
-    VehicleControllerParameters *parameters);
 void racing_env_initialize(
     RacingEnv *environment,
     const Track *track,
@@ -591,7 +491,6 @@ void genome_to_network(const float genes[NN_GENOME_COUNT],
 float network_random_unit(unsigned int *random_state);
 float network_random_gaussian(unsigned int *random_state);
 unsigned int network_random_seed(void);
-int load_track_geojson(Track *track, const char *filename);
 void racing_env_reset_at(
     RacingEnv *environment,
     float track_s,
@@ -608,7 +507,6 @@ void racing_env_step(
     const RacingAction *action,
     float elapsed,
     RacingStepResult *result);
-int car_has_left_track(const RacingEnv *environment);
 void neural_policy_predict(
     const NeuralPolicy *policy,
     const RacingObservation *observation,
@@ -630,6 +528,10 @@ void training_context_initialize(
     NeuralPolicy *active_policy,
     HWND completion_window,
     unsigned int random_seed);
+int training_configure_track_segment(
+    TrainingContext *training,
+    int start_geojson_index,
+    int end_geojson_index);
 int initialize_ga_thread_pool(TrainingContext *training);
 int submit_ga_generation(TrainingContext *training);
 void cleanup_ga_thread_pool(TrainingContext *training);
@@ -647,5 +549,4 @@ int render_direct2d(
     HWND window,
     const RacingEnv *environment,
     const TrainingContext *training,
-    int animation_running,
-    const char *status_message);
+    int animation_running);

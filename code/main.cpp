@@ -1,7 +1,5 @@
 #include "racing.h"
 
-#define app_window (application->window)
-#define status_message (application->status_message)
 #define display_track (application->track)
 #define display_car (application->environment.car)
 #define driving_policy (application->policy)
@@ -22,20 +20,10 @@
 #define track_pan_origin_x (application->renderer.track_pan_origin_x)
 #define track_pan_origin_y (application->renderer.track_pan_origin_y)
 #define command_hover (application->renderer.command_hover)
-
-void set_status_message(
-    ApplicationContext *application,
-    const char *text)
-{
-    snprintf(
-        status_message,
-        sizeof(status_message),
-        "%s",
-        text);
-
-    if (app_window)
-        InvalidateRect(app_window, NULL, FALSE);
-}
+#define segment_selection_stage \
+    (application->training.track_segment_selection_stage)
+#define segment_hover_index \
+    (application->training.track_segment_hover_geojson_index)
 
 void format_lap_time(
     float seconds,
@@ -76,11 +64,21 @@ int right_pane_command_at(
         RIGHT_PANE_TRAIN_SOURCE_GAP -
         RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
 
+    int scope_left = source_left;
+    int scope_top = source_top -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
+
+    int training_car_left = source_left;
+    int training_car_top = scope_top -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
+
     int fitness_width = RIGHT_PANE_FITNESS_BUTTON_WIDTH * 3 +
         RIGHT_PANE_FITNESS_BUTTON_GAP * 2;
     int fitness_left = pane_left +
         (RIGHT_PANE_WIDTH - fitness_width) / 2;
-    int fitness_top = source_top -
+    int fitness_top = training_car_top -
         RIGHT_PANE_TRAIN_SOURCE_GAP -
         RIGHT_PANE_FITNESS_BUTTON_HEIGHT;
     if (y >= fitness_top &&
@@ -110,6 +108,22 @@ int right_pane_command_at(
         return 4;
     }
 
+    if (x >= scope_left &&
+        x < scope_left + RIGHT_PANE_TRAIN_SOURCE_WIDTH &&
+        y >= scope_top &&
+        y < scope_top + RIGHT_PANE_TRAIN_SOURCE_HEIGHT)
+    {
+        return 8;
+    }
+
+    if (x >= training_car_left &&
+        x < training_car_left + RIGHT_PANE_TRAIN_SOURCE_WIDTH &&
+        y >= training_car_top &&
+        y < training_car_top + RIGHT_PANE_TRAIN_SOURCE_HEIGHT)
+    {
+        return 9;
+    }
+
     if (y < button_top || y >= button_top + RIGHT_PANE_BUTTON_HEIGHT)
         return -1;
 
@@ -134,7 +148,7 @@ int right_pane_command_is_disabled(
     int training_is_running,
     int workers_are_active)
 {
-    if (command >= 4 && command <= 7)
+    if (command >= 4 && command <= 8)
         return training_is_running || workers_are_active;
     if (command == 0 && !training_is_running && workers_are_active)
         return 1;
@@ -146,6 +160,18 @@ int right_pane_command_is_disabled(
    VECTOR FUNCTIONS
    ================================================================ */
 
+static void reset_training_preview(ApplicationContext *application)
+{
+    float start_s = application->training.use_track_segment
+        ? application->training.track_segment_start_s
+        : 0.0f;
+    racing_env_reset_at(
+        &application->environment,
+        start_s,
+        TIMING_LINE_START_FINISH);
+    application->training.training_preview_forward_progress = 0.0f;
+}
+
 void toggle_ga_training(ApplicationContext *application)
 {
     if (training_running) {
@@ -153,7 +179,6 @@ void toggle_ga_training(ApplicationContext *application)
         if (ga_training.initialized)
             genome_to_network(ga_best_genome.genes, &driving_policy);
         racing_env_reset(&application->environment);
-        set_status_message(application, "Genetic training stopped; best network activated.");
         return;
     }
 
@@ -161,22 +186,20 @@ void toggle_ga_training(ApplicationContext *application)
     training_running = 1;
     if (!ga_training.initialized)
         initialize_ga_population(&application->training);
+    genome_to_network(ga_best_genome.genes, &driving_policy);
+    reset_training_preview(application);
     if (!ga_workers_active && !submit_ga_generation(&application->training)) {
         training_running = 0;
-        set_status_message(application, "Could not start the Windows GA thread pool.");
         return;
     }
-    set_status_message(application, "Parallel genetic training running.");
 }
 
 
 void save_network(ApplicationContext *application)
 {
     FILE *file = fopen("../data/best_network.bin", "wb");
-    if (!file) {
-        set_status_message(application, "Could not open ../data/best_network.bin for writing.");
+    if (!file)
         return;
-    }
 
     const char magic[8] = {'R', 'A', 'C', 'E', 'N', 'N', '6', '\0'};
     int gene_count = NN_GENOME_COUNT;
@@ -186,23 +209,18 @@ void save_network(ApplicationContext *application)
     else
         network_to_genome(&driving_policy, genes);
 
-    int ok = fwrite(magic, sizeof(magic), 1, file) == 1 &&
+    (void)(fwrite(magic, sizeof(magic), 1, file) == 1 &&
         fwrite(&gene_count, sizeof(gene_count), 1, file) == 1 &&
-        fwrite(genes, sizeof(genes), 1, file) == 1;
+        fwrite(genes, sizeof(genes), 1, file) == 1);
     fclose(file);
-    set_status_message(application, ok
-        ? "Best neural network saved."
-        : "Failed while saving the neural network.");
 }
 
 
 void load_network(ApplicationContext *application)
 {
     FILE *file = fopen("../data/best_network.bin", "rb");
-    if (!file) {
-        set_status_message(application, "No saved neural network was found.");
+    if (!file)
         return;
-    }
 
     char magic[8];
     int gene_count = 0;
@@ -214,10 +232,7 @@ void load_network(ApplicationContext *application)
     const char expected[8] = {'R', 'A', 'C', 'E', 'N', 'N', '6', '\0'};
     if (!ok || memcmp(magic, expected, sizeof(magic)) != 0 ||
         gene_count != NN_GENOME_COUNT)
-    {
-        set_status_message(application, "Saved neural-network file is invalid.");
         return;
-    }
 
     training_running = 0;
     animation_running = 0;
@@ -228,7 +243,6 @@ void load_network(ApplicationContext *application)
     ga_best_genome.fitness = 0.0f;
     memset(&ga_training, 0, sizeof(ga_training));
     racing_env_reset(&application->environment);
-    set_status_message(application, "Neural network loaded.");
 }
 
 
@@ -243,10 +257,6 @@ void toggle_autonomous_car(ApplicationContext *application)
     if (!animation_running && car_has_left_track(&application->environment))
         racing_env_reset(&application->environment);
     animation_running = !animation_running;
-    set_status_message(application, 
-        animation_running
-        ? "Neural-network control running."
-        : "Neural-network control stopped.");
 }
 
 
@@ -263,16 +273,11 @@ LRESULT CALLBACK window_procedure(
         application = (ApplicationContext *)create->lpCreateParams;
         SetWindowLongPtrA(
             window, GWLP_USERDATA, (LONG_PTR)application);
-        application->window = window;
     }
     if (!application)
         return DefWindowProcA(window, message, wparam, lparam);
 
     switch (message) {
-    case WM_CREATE:
-        app_window = window;
-        return 0;
-
     case WM_SIZE:
         if (d2d_target) {
             d2d_target->Resize(
@@ -288,6 +293,8 @@ LRESULT CALLBACK window_procedure(
 
         switch (LOWORD(wparam)) {
         case 100:
+            if (segment_selection_stage != 0)
+                break;
             toggle_ga_training(application);
             break;
         case 101:
@@ -305,11 +312,6 @@ LRESULT CALLBACK window_procedure(
             application->training.start_from_random_weights =
                 !application->training.start_from_random_weights;
             ga_training.initialized = 0;
-            set_status_message(
-                application,
-                application->training.start_from_random_weights
-                ? "Next training run will use new randomized NN weights."
-                : "Next training run will use the current NN weights.");
             break;
         case 105:
         case 106:
@@ -322,15 +324,32 @@ LRESULT CALLBACK window_procedure(
                 if (application->training.fitness_function != selected) {
                     application->training.fitness_function = selected;
                     ga_training.initialized = 0;
-                    const char *fitness_messages[3] = {
-                        "Standard training fitness selected.",
-                        "Corner-exit speed training fitness selected.",
-                        "Adaptive curriculum training fitness selected."
-                    };
-                    set_status_message(
-                        application,
-                        fitness_messages[(int)selected]);
                 }
+            }
+            break;
+        case 108:
+            if (training_running || ga_workers_active)
+                break;
+            if (segment_selection_stage != 0) {
+                segment_selection_stage = 0;
+                segment_hover_index = -1;
+            } else if (application->training.use_track_segment) {
+                application->training.use_track_segment = 0;
+                ga_training.initialized = 0;
+            } else {
+                animation_running = 0;
+                segment_selection_stage = 1;
+                segment_hover_index = -1;
+            }
+            break;
+        case 109:
+            application->training.render_car_during_training =
+                !application->training.render_car_during_training;
+            if (training_running &&
+                application->training.render_car_during_training)
+            {
+                genome_to_network(ga_best_genome.genes, &driving_policy);
+                reset_training_preview(application);
             }
             break;
         default:
@@ -339,6 +358,14 @@ LRESULT CALLBACK window_procedure(
 
         InvalidateRect(window, NULL, FALSE);
         return 0;
+    case WM_KEYDOWN:
+        if (wparam == VK_ESCAPE && segment_selection_stage != 0) {
+            segment_selection_stage = 0;
+            segment_hover_index = -1;
+            InvalidateRect(window, NULL, FALSE);
+            return 0;
+        }
+        break;
     case WM_MOUSEWHEEL:
         {
             RECT client;
@@ -361,6 +388,17 @@ LRESULT CALLBACK window_procedure(
                 if (track_zoom > 12.0f)
                     track_zoom = 12.0f;
 
+                if (segment_selection_stage != 0) {
+                    int point = track_geojson_point_near_screen(
+                        &application->renderer,
+                        &display_track,
+                        &client,
+                        cursor.x,
+                        cursor.y,
+                        TRACK_POINT_PICK_RADIUS);
+                    segment_hover_index = point;
+                }
+
                 InvalidateRect(window, NULL, FALSE);
             }
         }
@@ -370,13 +408,47 @@ LRESULT CALLBACK window_procedure(
         {
             RECT client;
             GetClientRect(window, &client);
+            int x = (int)(short)LOWORD(lparam);
+            int y = (int)(short)HIWORD(lparam);
+            int map_width = client.right - RIGHT_PANE_WIDTH;
 
-            if ((int)(short)LOWORD(lparam) <
-                client.right / 2)
+            if (segment_selection_stage != 0 && x >= 0 && x < map_width) {
+                int geojson_index = track_geojson_point_near_screen(
+                    &application->renderer,
+                    &display_track,
+                    &client,
+                    x,
+                    y,
+                    TRACK_POINT_PICK_RADIUS);
+                if (geojson_index >= 0) {
+                    if (segment_selection_stage == 1) {
+                        application->training
+                            .track_segment_start_geojson_index =
+                            geojson_index;
+                        segment_selection_stage = 2;
+                    } else if (geojson_index != application->training
+                                   .track_segment_start_geojson_index &&
+                               training_configure_track_segment(
+                                   &application->training,
+                                   application->training
+                                       .track_segment_start_geojson_index,
+                                   geojson_index))
+                    {
+                        application->training.use_track_segment = 1;
+                        segment_selection_stage = 0;
+                        segment_hover_index = -1;
+                        ga_training.initialized = 0;
+                    }
+                    InvalidateRect(window, NULL, FALSE);
+                }
+                return 0;
+            }
+
+            if (x >= 0 && x < map_width)
             {
                 track_panning = 1;
-                track_pan_start_x = (int)(short)LOWORD(lparam);
-                track_pan_start_y = (int)(short)HIWORD(lparam);
+                track_pan_start_x = x;
+                track_pan_start_y = y;
                 track_pan_origin_x = track_pan_x;
                 track_pan_origin_y = track_pan_y;
                 SetCapture(window);
@@ -390,6 +462,21 @@ LRESULT CALLBACK window_procedure(
             GetClientRect(window, &client);
             int x = (int)(short)LOWORD(lparam);
             int y = (int)(short)HIWORD(lparam);
+            int map_width = client.right - RIGHT_PANE_WIDTH;
+            int previous_segment_hover = segment_hover_index;
+            if (segment_selection_stage != 0 &&
+                x >= 0 && x < map_width)
+            {
+                segment_hover_index = track_geojson_point_near_screen(
+                    &application->renderer,
+                    &display_track,
+                    &client,
+                    x,
+                    y,
+                    TRACK_POINT_PICK_RADIUS);
+            } else if (segment_selection_stage != 0) {
+                segment_hover_index = -1;
+            }
             int previous_hover = command_hover;
             command_hover = 0;
             int command = right_pane_command_at(&client, x, y);
@@ -399,7 +486,8 @@ LRESULT CALLBACK window_procedure(
             if (command >= 0)
                 command_hover = command + 100;
 
-            if (previous_hover != command_hover)
+            if (previous_hover != command_hover ||
+                previous_segment_hover != segment_hover_index)
                 InvalidateRect(window, NULL, FALSE);
         }
         if (track_panning && (wparam & MK_LBUTTON)) {
@@ -435,11 +523,15 @@ LRESULT CALLBACK window_procedure(
 
     case WM_GA_GENERATION_COMPLETE:
         if (collect_completed_ga_generation(&application->training, (LONG)wparam)) {
-            render_direct2d(&application->renderer, window, &application->environment, &application->training, animation_running, status_message);
+            if (application->training.render_car_during_training) {
+                /* Switch the live preview to the latest best controller
+                   without resetting its physical state or lap progress. */
+                genome_to_network(ga_best_genome.genes, &driving_policy);
+            }
+            render_direct2d(&application->renderer, window, &application->environment, &application->training, animation_running);
             if (training_running && !submit_ga_generation(&application->training)) {
                 training_running = 0;
-                set_status_message(application, 
-                    "Could not submit the next GA generation.");
+                InvalidateRect(window, NULL, FALSE);
             }
         }
         return 0;
@@ -448,7 +540,7 @@ LRESULT CALLBACK window_procedure(
     {
         PAINTSTRUCT paint;
         BeginPaint(window, &paint);
-        render_direct2d(&application->renderer, window, &application->environment, &application->training, animation_running, status_message);
+        render_direct2d(&application->renderer, window, &application->environment, &application->training, animation_running);
         EndPaint(window, &paint);
         return 0;
     }
@@ -457,7 +549,6 @@ LRESULT CALLBACK window_procedure(
         training_running = 0;
         cleanup_ga_thread_pool(&application->training);
         renderer_context_shutdown(&application->renderer);
-        app_window = NULL;
         PostQuitMessage(0);
         return 0;
     }
@@ -480,11 +571,6 @@ int WINAPI WinMain(
         1, sizeof(*application));
     if (!application)
         return 1;
-    snprintf(
-        status_message,
-        sizeof(status_message),
-        "%s",
-        "Random untrained neural network ready.");
 
     (void)previous_instance;
     (void)command_line;
@@ -603,7 +689,9 @@ int WINAPI WinMain(
 
         LARGE_INTEGER current_counter;
         QueryPerformanceCounter(&current_counter);
-        int simulation_running = animation_running;
+        int training_preview_running = training_running &&
+            application->training.render_car_during_training;
+        int simulation_running = animation_running || training_preview_running;
 
         if (simulation_running && !was_simulation_running) {
             previous_counter = current_counter;
@@ -637,17 +725,37 @@ int WINAPI WinMain(
                 &action,
                 elapsed,
                 &step_result);
-            if (step_result.left_track) {
+            if (training_preview_running) {
+                application->training.training_preview_forward_progress +=
+                    step_result.track_progress;
+                int completed_segment =
+                    application->training.use_track_segment &&
+                    application->training.training_preview_forward_progress >=
+                        application->training.track_segment_length;
+                int crashed = step_result.left_track ||
+                    step_result.stationary;
+                if (crashed || completed_segment) {
+                    genome_to_network(
+                        ga_best_genome.genes,
+                        &driving_policy);
+                    reset_training_preview(application);
+                } else if (step_result.completed_lap) {
+                    /* Adopt the latest best controller at the lap boundary,
+                       preserving the car state so the preview continues into
+                       the next lap without teleporting to start/finish. */
+                    genome_to_network(
+                        ga_best_genome.genes,
+                        &driving_policy);
+                }
+            } else if (step_result.left_track) {
                 animation_running = 0;
                 display_car.v_x = 0.0f;
                 display_car.v_y = 0.0f;
                 display_car.throttle = 0.0f;
                 display_car.brake = 0.0f;
                 display_car.steering_command = 0.0f;
-                set_status_message(application, 
-                    "Run stopped: the car left the track.");
             }
-            render_direct2d(&application->renderer, window, &application->environment, &application->training, animation_running, status_message);
+            render_direct2d(&application->renderer, window, &application->environment, &application->training, animation_running);
 
             do {
                 next_frame_counter += frame_ticks;

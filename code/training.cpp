@@ -1,7 +1,6 @@
 #include "racing.h"
 
 #define ga_population (training->population)
-#define ga_next_population (training->next_population)
 #define ga_best_genome (training->best_genome)
 #define ga_training (training->metrics)
 #define ga_thread_pool (training->thread_pool)
@@ -21,6 +20,33 @@
 #define display_track (*environment->track)
 #define display_car (environment->car)
 
+int training_configure_track_segment(
+    TrainingContext *training,
+    int start_geojson_index,
+    int end_geojson_index)
+{
+    float start_s;
+    float end_s;
+    if (!training || start_geojson_index == end_geojson_index ||
+        !track_s_at_geojson_point(
+            training->track, start_geojson_index, &start_s) ||
+        !track_s_at_geojson_point(
+            training->track, end_geojson_index, &end_s))
+    {
+        return 0;
+    }
+
+    float length = track_forward_distance(training->track, start_s, end_s);
+    if (length <= 0.0f)
+        return 0;
+
+    training->track_segment_start_geojson_index = start_geojson_index;
+    training->track_segment_end_geojson_index = end_geojson_index;
+    training->track_segment_start_s = start_s;
+    training->track_segment_length = length;
+    return 1;
+}
+
 void training_context_initialize(
     TrainingContext *training,
     const Track *track,
@@ -39,6 +65,11 @@ void training_context_initialize(
     training->active_policy = active_policy;
     training->completion_window = completion_window;
     training->random_state = random_seed;
+    training->track_segment_hover_geojson_index = -1;
+    training_configure_track_segment(
+        training,
+        TRACK_TRAINING_SEGMENT_START_POINT_INDEX,
+        TRACK_TRAINING_SEGMENT_END_POINT_INDEX);
     for (int candidate = 0; candidate < GA_POPULATION_SIZE; candidate++) {
         GaWorkContext *context = &training->work_contexts[candidate];
         context->candidate = candidate;
@@ -138,9 +169,13 @@ static void finalize_episode_fitness(
     if (environment->track->total_length <= 0.0f || maximum_speed <= 0.0f)
         return;
 
-    float progress_ratio = fmaxf(0.0f, fminf(
-        result->forward_progress / environment->track->total_length,
-        1.0f));
+    float target_length = evaluator->use_track_segment
+        ? evaluator->track_segment_length
+        : environment->track->total_length;
+    if (target_length <= 0.0f)
+        return;
+    float progress_ratio = clamp01(
+        result->forward_progress / target_length);
     float average_speed = result->speed_integral /
         (result->steps * GA_FIXED_STEP);
     float average_speed_ratio = fmaxf(0.0f, fminf(
@@ -154,6 +189,31 @@ static void finalize_episode_fitness(
         parameters->curriculum_incomplete_average_speed_reward *
         progress_ratio * progress_ratio *
         average_speed_ratio * survival_factor;
+}
+
+static void finalize_track_segment_completion(
+    const EpisodeEvaluator *evaluator,
+    EpisodeEvaluationResult *result)
+{
+    const RacingEnv *environment = evaluator->environment;
+    const RewardParameters *parameters = environment->reward_parameters;
+    float maximum_speed = environment->parameters->max_speed_kmh / 3.6f;
+    float elapsed = result->steps * GA_FIXED_STEP;
+    float average_speed = elapsed > 0.0f
+        ? evaluator->track_segment_length / elapsed
+        : 0.0f;
+    float speed_ratio = maximum_speed > 0.0f
+        ? clamp01(average_speed / maximum_speed)
+        : 0.0f;
+    float speed_reward = parameters->lap_speed_reward * speed_ratio;
+
+    result->completed_lap = 1;
+    result->circuit_time = elapsed;
+    result->fitness += parameters->lap_completion_reward;
+    result->fitness += evaluator->fitness_function ==
+            TRAINING_FITNESS_CURRICULUM
+        ? evaluator->curriculum_performance_blend * speed_reward
+        : speed_reward;
 }
 
 
@@ -183,6 +243,26 @@ void episode_evaluate(
             environment, &action, GA_FIXED_STEP, &step_result);
         result->steps++;
 
+        if (evaluator->use_track_segment) {
+            if (step_result.completed_lap) {
+                step_result.reward -= step_result.terminal_reward;
+                step_result.terminal_reward = 0.0f;
+                step_result.completed_lap = 0;
+                step_result.terminated =
+                    step_result.left_track || step_result.stationary;
+            }
+            if (evaluator->track_segment_length > 0.0f) {
+                float progress_scale =
+                    display_track.total_length /
+                    evaluator->track_segment_length;
+                float original_progress_reward =
+                    step_result.progress_reward;
+                step_result.progress_reward *= progress_scale;
+                step_result.reward += step_result.progress_reward -
+                    original_progress_reward;
+            }
+        }
+
         result->speed_integral += display_car.v_x * GA_FIXED_STEP;
         result->top_speed = fmaxf(result->top_speed, display_car.v_x);
         result->forward_progress += step_result.track_progress;
@@ -202,6 +282,13 @@ void episode_evaluate(
         result->fitness += selected_step_fitness(
             evaluator,
             &step_result);
+
+        if (evaluator->use_track_segment && !step_result.terminated &&
+            result->forward_progress >= evaluator->track_segment_length)
+        {
+            finalize_track_segment_completion(evaluator, result);
+            return;
+        }
 
         if (step_result.completed_lap) {
             result->completed_lap = 1;
@@ -238,10 +325,11 @@ static void ga_candidate_evaluate(
     /*
      * GA FITNESS CALCULATION
      * ----------------------
-     * Each genome runs three independent episodes, starting at the
-     * start/finish line, Sector 1, and Sector 2. An episode is capped at
-     * GA_MAX_EPISODE_STEPS fixed simulation steps. The final genome fitness
-     * is the arithmetic mean of the three episode fitness values.
+     * Full-lap training runs three independent episodes, starting at the
+     * start/finish line, Sector 1, and Sector 2. Segment training runs one
+     * episode from its configured GeoJSON start point to its end point.
+     * An episode is capped at GA_MAX_EPISODE_STEPS fixed simulation steps.
+     * Full-lap fitness is the arithmetic mean of its three episodes.
      *
      * Standard mode uses the original environment reward. Corner-exit mode
      * adds one bounded apex-to-exit event reward. Curriculum mode begins with
@@ -249,10 +337,9 @@ static void ga_candidate_evaluate(
      * lap speed, incomplete-lap average speed, corner exit, jerk, and pedal-
      * oscillation terms through one blend frozen for the whole generation.
      *
-     * Average speed, top speed, track progress, and lap completion are
-     * collected only from the start/finish episode. The speed values and lap
-     * completion are shown in the side pane. A genome counts as completing a
-     * lap once.
+     * Average speed, top speed, track progress, and target completion are
+     * collected only from the primary episode. The speed values and lap or
+     * segment completion are shown in the side pane.
      * Sector-start telemetry is ignored, although all three fitness values
      * still affect selection. Telemetry does not add any extra fitness.
      */
@@ -260,10 +347,17 @@ static void ga_candidate_evaluate(
         environment,
         &context->policy,
         training->fitness_function,
-        training->curriculum_performance_blend};
-    for (int start = 0; start < GA_START_POSITION_COUNT; start++) {
-        float start_s = 0.0f;
-        if (start > 0) {
+        training->curriculum_performance_blend,
+        training->use_track_segment,
+        training->track_segment_length};
+    int episode_count = training->use_track_segment
+        ? 1
+        : GA_START_POSITION_COUNT;
+    for (int start = 0; start < episode_count; start++) {
+        float start_s = training->use_track_segment
+            ? training->track_segment_start_s
+            : 0.0f;
+        if (!training->use_track_segment && start > 0) {
             start_s = display_track.has_sectors
                 ? display_track.sector_s[start - 1]
                 : display_track.total_length *
@@ -288,19 +382,21 @@ static void ga_candidate_evaluate(
         }
     }
 
-    context->fitness = total_fitness / GA_START_POSITION_COUNT;
+    context->fitness = total_fitness / episode_count;
     context->average_progress_reward =
-        total_progress_reward / GA_START_POSITION_COUNT;
+        total_progress_reward / episode_count;
     context->average_control_penalty =
-        total_control_penalty / GA_START_POSITION_COUNT;
+        total_control_penalty / episode_count;
     context->average_speed = start_finish_episode_steps > 0
         ? start_finish_speed_integral /
           (start_finish_episode_steps * GA_FIXED_STEP) * 3.6f
         : 0.0f;
     context->top_speed = start_finish_top_speed * 3.6f;
-    context->track_progress = display_track.total_length > 0.0f
-        ? start_finish_forward_progress /
-          display_track.total_length * 100.0f
+    float target_length = training->use_track_segment
+        ? training->track_segment_length
+        : display_track.total_length;
+    context->track_progress = target_length > 0.0f
+        ? clamp01(start_finish_forward_progress / target_length) * 100.0f
         : 0.0f;
     context->completed_start_finish_lap = completed_start_finish_lap;
     context->start_finish_left_track = start_finish_left_track;
@@ -529,12 +625,45 @@ void cleanup_ga_thread_pool(TrainingContext *training)
 }
 
 
+static void reset_es_candidate_metrics(Genome *candidate)
+{
+    candidate->fitness = -FLT_MAX;
+    candidate->average_speed = 0.0f;
+    candidate->top_speed = 0.0f;
+    candidate->track_progress = 0.0f;
+}
+
+static void sample_mirrored_es_population(TrainingContext *training)
+{
+    const int pair_count = GA_POPULATION_SIZE / 2;
+    for (int pair = 0; pair < pair_count; pair++) {
+        Genome *positive = &ga_population[pair * 2];
+        Genome *negative = &ga_population[pair * 2 + 1];
+        for (int gene = 0; gene < NN_GENOME_COUNT; gene++) {
+            float perturbation = network_random_gaussian(
+                &training->random_state) * ES_PERTURBATION_STDDEV;
+            positive->genes[gene] =
+                training->es_mean[gene] + perturbation;
+            negative->genes[gene] =
+                training->es_mean[gene] - perturbation;
+        }
+        reset_es_candidate_metrics(positive);
+        reset_es_candidate_metrics(negative);
+    }
+}
+
 void initialize_ga_population(TrainingContext *training)
 {
     memset(&ga_training, 0, sizeof(ga_training));
     training->curriculum_performance_blend = 0.0f;
     training->curriculum_progress_ema = 0.0f;
     training->curriculum_completion_ema = 0.0f;
+    training->es_optimizer_step = 0;
+    memset(training->es_adam_first_moment, 0,
+           sizeof(training->es_adam_first_moment));
+    memset(training->es_adam_second_moment, 0,
+           sizeof(training->es_adam_second_moment));
+
     NeuralPolicy randomized_policy;
     const NeuralPolicy *seed_policy = &driving_policy;
     if (training->start_from_random_weights) {
@@ -543,26 +672,11 @@ void initialize_ga_population(TrainingContext *training)
             &training->random_state);
         seed_policy = &randomized_policy;
     }
-    network_to_genome(seed_policy, ga_population[0].genes);
-    ga_population[0].fitness = -FLT_MAX;
-    ga_population[0].average_speed = 0.0f;
-    ga_population[0].top_speed = 0.0f;
-    ga_population[0].track_progress = 0.0f;
+    network_to_genome(seed_policy, training->es_mean);
     memcpy(ga_best_genome.genes,
-           ga_population[0].genes,
+           training->es_mean,
            sizeof(ga_best_genome.genes));
-
-    for (int candidate = 1; candidate < GA_POPULATION_SIZE; candidate++) {
-        for (int gene = 0; gene < NN_GENOME_COUNT; gene++) {
-            ga_population[candidate].genes[gene] =
-                ga_population[0].genes[gene] +
-                network_random_gaussian(&training->random_state) * 0.15f;
-        }
-        ga_population[candidate].fitness = -FLT_MAX;
-        ga_population[candidate].average_speed = 0.0f;
-        ga_population[candidate].top_speed = 0.0f;
-        ga_population[candidate].track_progress = 0.0f;
-    }
+    sample_mirrored_es_population(training);
 
     ga_training.initialized = 1;
     ga_training.generation = 1;
@@ -572,30 +686,30 @@ void initialize_ga_population(TrainingContext *training)
     ga_best_genome.fitness = -FLT_MAX;
 }
 
-
-void evolve_ga_population(TrainingContext *training)
+static void evolve_es_population(TrainingContext *training)
 {
     int ranked[GA_POPULATION_SIZE];
+    float utility[GA_POPULATION_SIZE];
     for (int candidate = 0; candidate < GA_POPULATION_SIZE; candidate++)
         ranked[candidate] = candidate;
-    for (int rank = 0; rank < GA_ELITE_COUNT; rank++) {
-        int best_rank = rank;
-        for (int candidate_rank = rank + 1;
-             candidate_rank < GA_POPULATION_SIZE;
-             candidate_rank++)
+    for (int rank = 1; rank < GA_POPULATION_SIZE; rank++) {
+        int candidate = ranked[rank];
+        int insertion = rank;
+        while (insertion > 0 &&
+               ga_population[ranked[insertion - 1]].fitness >
+                   ga_population[candidate].fitness)
         {
-            if (ga_population[ranked[candidate_rank]].fitness >
-                ga_population[ranked[best_rank]].fitness)
-            {
-                best_rank = candidate_rank;
-            }
+            ranked[insertion] = ranked[insertion - 1];
+            insertion--;
         }
-        int swap = ranked[rank];
-        ranked[rank] = ranked[best_rank];
-        ranked[best_rank] = swap;
+        ranked[insertion] = candidate;
     }
-    int best = ranked[0];
+    for (int rank = 0; rank < GA_POPULATION_SIZE; rank++) {
+        utility[ranked[rank]] =
+            (float)rank / (GA_POPULATION_SIZE - 1) - 0.5f;
+    }
 
+    int best = ranked[GA_POPULATION_SIZE - 1];
     float fitness_sum = 0.0f;
     for (int candidate = 0; candidate < GA_POPULATION_SIZE; candidate++)
         fitness_sum += ga_population[candidate].fitness;
@@ -607,38 +721,37 @@ void evolve_ga_population(TrainingContext *training)
     float generation_best_track_progress =
         ga_population[best].track_progress;
 
-    if (training->fitness_function == TRAINING_FITNESS_CURRICULUM ||
-        ga_population[best].fitness > ga_training.best_fitness)
-        ga_training.best_fitness = ga_population[best].fitness;
-    genome_to_network(ga_population[best].genes, &driving_policy);
-
-    for (int elite = 0; elite < GA_ELITE_COUNT; elite++)
-        ga_next_population[elite] = ga_population[ranked[elite]];
-
-    /* Preserve coherent networks: every child starts as an exact copy of
-       one elite, then explores locally through mutation. Distributing
-       children round-robin gives each elite equal representation. */
-    for (int child = GA_ELITE_COUNT; child < GA_POPULATION_SIZE; child++) {
-        int elite = (child - GA_ELITE_COUNT) % GA_ELITE_COUNT;
-        int parent = ranked[elite];
-        ga_next_population[child] = ga_population[parent];
-        for (int gene = 0; gene < NN_GENOME_COUNT; gene++) {
-            if (network_random_unit(&training->random_state) <
-                GA_MUTATION_PROBABILITY)
-            {
-                ga_next_population[child].genes[gene] +=
-                    network_random_gaussian(&training->random_state) *
-                    GA_MUTATION_SCALE;
-            }
+    training->es_optimizer_step++;
+    float beta1_correction = 1.0f - powf(
+        ES_ADAM_BETA1, (float)training->es_optimizer_step);
+    float beta2_correction = 1.0f - powf(
+        ES_ADAM_BETA2, (float)training->es_optimizer_step);
+    const int pair_count = GA_POPULATION_SIZE / 2;
+    for (int gene = 0; gene < NN_GENOME_COUNT; gene++) {
+        float gradient = 0.0f;
+        for (int pair = 0; pair < pair_count; pair++) {
+            int positive = pair * 2;
+            int negative = positive + 1;
+            float epsilon =
+                (ga_population[positive].genes[gene] -
+                 ga_population[negative].genes[gene]) /
+                (2.0f * ES_PERTURBATION_STDDEV);
+            gradient +=
+                (utility[positive] - utility[negative]) * epsilon;
         }
-        ga_next_population[child].fitness = -FLT_MAX;
-        ga_next_population[child].average_speed = 0.0f;
-        ga_next_population[child].top_speed = 0.0f;
-        ga_next_population[child].track_progress = 0.0f;
-    }
+        gradient /= pair_count * ES_PERTURBATION_STDDEV;
 
-    for (int candidate = 0; candidate < GA_POPULATION_SIZE; candidate++)
-        ga_population[candidate] = ga_next_population[candidate];
+        float *first_moment = &training->es_adam_first_moment[gene];
+        float *second_moment = &training->es_adam_second_moment[gene];
+        *first_moment = ES_ADAM_BETA1 * *first_moment +
+            (1.0f - ES_ADAM_BETA1) * gradient;
+        *second_moment = ES_ADAM_BETA2 * *second_moment +
+            (1.0f - ES_ADAM_BETA2) * gradient * gradient;
+        float corrected_first = *first_moment / beta1_correction;
+        float corrected_second = *second_moment / beta2_correction;
+        training->es_mean[gene] += ES_LEARNING_RATE * corrected_first /
+            (sqrtf(corrected_second) + ES_ADAM_EPSILON);
+    }
 
     ga_training.completed_generations = ga_training.generation;
     ga_training.reported_best_fitness = generation_best_fitness;
@@ -651,6 +764,8 @@ void evolve_ga_population(TrainingContext *training)
     ga_training.reported_best_track_progress =
         generation_best_track_progress;
     ga_training.generation++;
+
+    sample_mirrored_es_population(training);
 }
 
 
@@ -708,6 +823,31 @@ static void update_curriculum_performance_blend(
         1.0f));
 
     ga_training.reported_median_track_progress = median_progress;
+}
+
+
+static void record_training_generation(TrainingContext *training)
+{
+    TrainingGenerationSample *sample =
+        &ga_training.history[ga_training.history_next];
+    sample->average_fitness = ga_training.reported_average_fitness;
+    sample->average_speed = ga_training.reported_best_average_speed;
+    sample->average_progress_reward =
+        ga_training.reported_average_progress_reward;
+    sample->average_control_penalty =
+        ga_training.reported_average_control_penalty;
+    sample->off_track_percentage =
+        ga_training.reported_off_track_percentage;
+    sample->lap_completion_percentage =
+        ga_training.reported_lap_completion_percentage;
+    sample->median_track_progress =
+        ga_training.reported_median_track_progress;
+    sample->performance_blend = training->curriculum_performance_blend;
+
+    ga_training.history_next =
+        (ga_training.history_next + 1) % TRAINING_TREND_HISTORY_COUNT;
+    if (ga_training.history_count < TRAINING_TREND_HISTORY_COUNT)
+        ga_training.history_count++;
 }
 
 
@@ -786,7 +926,8 @@ int collect_completed_ga_generation(TrainingContext *training, LONG batch_token)
     if (training->fitness_function == TRAINING_FITNESS_CURRICULUM)
         update_curriculum_performance_blend(training);
 
-    evolve_ga_population(training);
+    evolve_es_population(training);
+    record_training_generation(training);
     return 1;
 }
 
@@ -808,5 +949,4 @@ int collect_completed_ga_generation(TrainingContext *training, LONG batch_token)
 #undef ga_thread_pool
 #undef ga_training
 #undef ga_best_genome
-#undef ga_next_population
 #undef ga_population

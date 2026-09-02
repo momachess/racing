@@ -11,6 +11,8 @@
 #define d2d_car_brush (renderer->d2d_car_brush)
 #define d2d_blue_brush (renderer->d2d_blue_brush)
 #define d2d_red_brush (renderer->d2d_red_brush)
+#define d2d_green_brush (renderer->d2d_green_brush)
+#define d2d_amber_brush (renderer->d2d_amber_brush)
 #define d2d_tick_brush (renderer->d2d_tick_brush)
 #define d2d_gauge_text_brush (renderer->d2d_gauge_text_brush)
 #define d2d_command_brush (renderer->d2d_command_brush)
@@ -222,6 +224,16 @@ HRESULT create_d2d_resources(RendererContext *renderer, HWND window)
         if (FAILED(result))
             return result;
         result = d2d_target->CreateSolidColorBrush(
+            D2D1::ColorF(0.25f, 0.80f, 0.42f),
+            &d2d_green_brush);
+        if (FAILED(result))
+            return result;
+        result = d2d_target->CreateSolidColorBrush(
+            D2D1::ColorF(0.95f, 0.68f, 0.20f),
+            &d2d_amber_brush);
+        if (FAILED(result))
+            return result;
+        result = d2d_target->CreateSolidColorBrush(
             D2D1::ColorF(0.24f, 0.43f, 0.64f),
             &d2d_tick_brush);
         if (FAILED(result))
@@ -288,6 +300,8 @@ void discard_d2d_target(RendererContext *renderer)
     release_d2d(&d2d_command_brush);
     release_d2d(&d2d_tick_brush);
     release_d2d(&d2d_gauge_text_brush);
+    release_d2d(&d2d_amber_brush);
+    release_d2d(&d2d_green_brush);
     release_d2d(&d2d_red_brush);
     release_d2d(&d2d_blue_brush);
     release_d2d(&d2d_car_brush);
@@ -300,7 +314,7 @@ void discard_d2d_target(RendererContext *renderer)
 }
 
 TrackRenderView make_track_render_view(
-    RendererContext *renderer,
+    const RendererContext *renderer,
     const Track *track,
     const RECT *client)
 {
@@ -582,7 +596,7 @@ void draw_d2d_right_text(
 {
     wchar_t wide_text[512];
     int length = MultiByteToWideChar(
-        CP_ACP, 0, text, -1, wide_text, 512);
+        CP_UTF8, 0, text, -1, wide_text, 512);
 
     if (length > 0) {
         dwrite_pane_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -592,6 +606,129 @@ void draw_d2d_right_text(
             dwrite_pane_format,
             D2D1::RectF(x, y, x + width, y + height),
             d2d_pane_value_brush);
+        dwrite_pane_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+}
+
+int track_geojson_point_near_screen(
+    const RendererContext *renderer,
+    const Track *track,
+    const RECT *client,
+    int screen_x,
+    int screen_y,
+    float maximum_distance)
+{
+    if (!renderer || !track || !client || track->point_count <= 0)
+        return -1;
+
+    TrackRenderView view = make_track_render_view(renderer, track, client);
+    float closest_distance_squared = maximum_distance * maximum_distance;
+    int closest_point = -1;
+    for (int point = 0; point < track->point_count; point++) {
+        D2D1_POINT_2F screen = track_screen_point(track->points[point], &view);
+        float dx = screen.x - screen_x;
+        float dy = screen.y - screen_y;
+        float distance_squared = dx * dx + dy * dy;
+        if (distance_squared <= closest_distance_squared) {
+            closest_distance_squared = distance_squared;
+            closest_point = point;
+        }
+    }
+
+    return closest_point >= 0
+        ? track_geojson_index_at_point(track, closest_point)
+        : -1;
+}
+
+static void draw_track_point_marker(
+    RendererContext *renderer,
+    const Track *track,
+    const TrackRenderView *view,
+    int geojson_index,
+    ID2D1Brush *fill_brush,
+    float radius)
+{
+    float track_s;
+    if (!track_s_at_geojson_point(track, geojson_index, &track_s))
+        return;
+
+    D2D1_POINT_2F screen = track_screen_point(
+        track_position_at_s(track, track_s), view);
+    D2D1_ELLIPSE marker = D2D1::Ellipse(screen, radius, radius);
+    d2d_target->FillEllipse(marker, fill_brush);
+    d2d_target->DrawEllipse(marker, d2d_white_brush, 2.0f);
+}
+
+static void draw_track_segment_selection(
+    RendererContext *renderer,
+    const Track *track,
+    const TrackRenderView *view,
+    const TrainingContext *training)
+{
+    if (training->track_segment_selection_stage != 0) {
+        for (int point = 0; point < track->point_count; point++) {
+            D2D1_POINT_2F screen = track_screen_point(
+                track->points[point], view);
+            d2d_target->FillEllipse(
+                D2D1::Ellipse(screen, 2.5f, 2.5f),
+                d2d_center_brush);
+        }
+    }
+
+    if (training->use_track_segment ||
+        training->track_segment_selection_stage == 2)
+    {
+        draw_track_point_marker(
+            renderer,
+            track,
+            view,
+            training->track_segment_start_geojson_index,
+            d2d_green_brush,
+            7.0f);
+    }
+    if (training->use_track_segment) {
+        draw_track_point_marker(
+            renderer,
+            track,
+            view,
+            training->track_segment_end_geojson_index,
+            d2d_red_brush,
+            7.0f);
+    }
+    if (training->track_segment_selection_stage != 0 &&
+        training->track_segment_hover_geojson_index >= 0)
+    {
+        draw_track_point_marker(
+            renderer,
+            track,
+            view,
+            training->track_segment_hover_geojson_index,
+            d2d_amber_brush,
+            9.0f);
+    }
+}
+
+void draw_d2d_right_text_brush(
+    RendererContext *renderer,
+    const char *text,
+    float x,
+    float y,
+    float width,
+    float height,
+    ID2D1Brush *brush)
+{
+    wchar_t wide_text[512];
+    int length = MultiByteToWideChar(
+        CP_UTF8, 0, text, -1, wide_text, 512);
+
+    if (length > 0) {
+        dwrite_pane_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        d2d_target->DrawText(
+            wide_text,
+            length - 1,
+            dwrite_pane_format,
+            D2D1::RectF(x, y, x + width, y + height),
+            brush);
         dwrite_pane_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 }
@@ -607,7 +744,7 @@ void draw_d2d_pane_text(
 {
     wchar_t wide_text[512];
     int length = MultiByteToWideChar(
-        CP_ACP, 0, text, -1, wide_text, 512);
+        CP_UTF8, 0, text, -1, wide_text, 512);
 
     if (length > 0)
         d2d_target->DrawText(
@@ -618,6 +755,207 @@ void draw_d2d_pane_text(
             brush);
 }
 
+typedef enum {
+    TRAINING_METRIC_AVERAGE_FITNESS,
+    TRAINING_METRIC_AVERAGE_SPEED,
+    TRAINING_METRIC_PROGRESS_REWARD,
+    TRAINING_METRIC_CONTROL_PENALTY,
+    TRAINING_METRIC_OFF_TRACK,
+    TRAINING_METRIC_LAP_COMPLETION,
+    TRAINING_METRIC_MEDIAN_PROGRESS
+} TrainingTrendMetric;
+
+typedef struct {
+    float average_fitness_delta;
+    float average_speed_delta;
+    float progress_reward_delta;
+    float control_penalty_delta;
+    float off_track_delta;
+    float lap_completion_delta;
+    float median_progress_delta;
+    float score;
+    int warming_up;
+    int direction;
+    const char *phase;
+    const char *confidence;
+} TrainingTrendAnalysis;
+
+static const TrainingGenerationSample *training_history_sample(
+    const GeneticTraining *metrics,
+    int chronological_index)
+{
+    int oldest = metrics->history_next - metrics->history_count;
+    while (oldest < 0)
+        oldest += TRAINING_TREND_HISTORY_COUNT;
+    int index = (oldest + chronological_index) %
+        TRAINING_TREND_HISTORY_COUNT;
+    return &metrics->history[index];
+}
+
+static float training_metric_value(
+    const TrainingGenerationSample *sample,
+    TrainingTrendMetric metric)
+{
+    switch (metric) {
+    case TRAINING_METRIC_AVERAGE_SPEED:
+        return sample->average_speed;
+    case TRAINING_METRIC_PROGRESS_REWARD:
+        return sample->average_progress_reward;
+    case TRAINING_METRIC_CONTROL_PENALTY:
+        return sample->average_control_penalty;
+    case TRAINING_METRIC_OFF_TRACK:
+        return sample->off_track_percentage;
+    case TRAINING_METRIC_LAP_COMPLETION:
+        return sample->lap_completion_percentage;
+    case TRAINING_METRIC_MEDIAN_PROGRESS:
+        return sample->median_track_progress;
+    case TRAINING_METRIC_AVERAGE_FITNESS:
+    default:
+        return sample->average_fitness;
+    }
+}
+
+static float training_metric_average(
+    const GeneticTraining *metrics,
+    TrainingTrendMetric metric,
+    int first,
+    int count)
+{
+    float sum = 0.0f;
+    for (int index = 0; index < count; index++)
+        sum += training_metric_value(
+            training_history_sample(metrics, first + index), metric);
+    return count > 0 ? sum / count : 0.0f;
+}
+
+static float training_metric_window_delta(
+    const GeneticTraining *metrics,
+    TrainingTrendMetric metric,
+    int window)
+{
+    int count = metrics->history_count;
+    float previous = training_metric_average(
+        metrics, metric, count - 2 * window, window);
+    float current = training_metric_average(
+        metrics, metric, count - window, window);
+    return current - previous;
+}
+
+static void analyze_training_trend(
+    const TrainingContext *training,
+    TrainingTrendAnalysis *analysis)
+{
+    memset(analysis, 0, sizeof(*analysis));
+    const GeneticTraining *metrics = &training->metrics;
+    int count = metrics->history_count;
+    analysis->warming_up = count < 6;
+    analysis->confidence = count >= 20
+        ? "High"
+        : count >= 10 ? "Medium" : "Low";
+
+    if (training->fitness_function == TRAINING_FITNESS_CURRICULUM) {
+        if (training->curriculum_performance_blend < 0.25f) {
+            analysis->phase = "Track mastery";
+        } else if (training->curriculum_performance_blend < 0.75f) {
+            analysis->phase = "Balanced transition";
+        } else {
+            analysis->phase = "Performance tuning";
+        }
+    } else if (metrics->reported_lap_completion_percentage < 10.0f) {
+        analysis->phase = "Track mastery";
+    } else if (metrics->reported_off_track_percentage > 30.0f) {
+        analysis->phase = "Reliability";
+    } else {
+        analysis->phase = "Performance tuning";
+    }
+
+    if (analysis->warming_up)
+        return;
+
+    int window = count / 2;
+    if (window > 10)
+        window = 10;
+    analysis->average_fitness_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_AVERAGE_FITNESS, window);
+    analysis->average_speed_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_AVERAGE_SPEED, window);
+    analysis->progress_reward_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_PROGRESS_REWARD, window);
+    analysis->control_penalty_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_CONTROL_PENALTY, window);
+    analysis->off_track_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_OFF_TRACK, window);
+    analysis->lap_completion_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_LAP_COMPLETION, window);
+    analysis->median_progress_delta = training_metric_window_delta(
+        metrics, TRAINING_METRIC_MEDIAN_PROGRESS, window);
+
+    float previous_fitness = training_metric_average(
+        metrics,
+        TRAINING_METRIC_AVERAGE_FITNESS,
+        count - 2 * window,
+        window);
+    float fitness_scale = fmaxf(fabsf(previous_fitness), 1.0f);
+    float fitness_signal = clamp01(
+        0.5f + analysis->average_fitness_delta /
+            (0.20f * fitness_scale)) * 2.0f - 1.0f;
+    float completion_signal = fmaxf(-1.0f, fminf(
+        analysis->lap_completion_delta / 10.0f, 1.0f));
+    float off_track_signal = fmaxf(-1.0f, fminf(
+        -analysis->off_track_delta / 10.0f, 1.0f));
+    float speed_signal = fmaxf(-1.0f, fminf(
+        analysis->average_speed_delta / 10.0f, 1.0f));
+    float control_signal = fmaxf(-1.0f, fminf(
+        analysis->control_penalty_delta / 0.05f, 1.0f));
+
+    if (training->fitness_function == TRAINING_FITNESS_CURRICULUM) {
+        float progress_signal = fmaxf(-1.0f, fminf(
+            analysis->median_progress_delta / 8.0f, 1.0f));
+        float mastery_score =
+            0.35f * progress_signal +
+            0.25f * completion_signal +
+            0.25f * off_track_signal +
+            0.15f * fitness_signal;
+        float performance_score =
+            0.25f * fitness_signal +
+            0.25f * completion_signal +
+            0.20f * off_track_signal +
+            0.20f * speed_signal +
+            0.10f * control_signal;
+        float performance_weight = clamp01(
+            (training->curriculum_performance_blend - 0.25f) / 0.50f);
+        analysis->score =
+            (1.0f - performance_weight) * mastery_score +
+            performance_weight * performance_score;
+    } else {
+        analysis->score =
+            0.25f * fitness_signal +
+            0.25f * completion_signal +
+            0.20f * off_track_signal +
+            0.20f * speed_signal +
+            0.10f * control_signal;
+    }
+    analysis->direction = analysis->score > 0.15f
+        ? 1
+        : analysis->score < -0.15f ? -1 : 0;
+}
+
+static void draw_training_row(
+    RendererContext *renderer,
+    const char *label,
+    const char *value,
+    float left,
+    float right,
+    float y,
+    ID2D1Brush *value_brush)
+{
+    draw_d2d_pane_text(
+        renderer, label, left, y, right - left, 22.0f,
+        d2d_pane_label_brush);
+    draw_d2d_right_text_brush(
+        renderer, value, left, y, right - left, 24.0f,
+        value_brush);
+}
 
 void update_run_chart(
     RendererContext *renderer,
@@ -855,8 +1193,7 @@ int render_direct2d(
     HWND window,
     const RacingEnv *environment,
     const TrainingContext *training,
-    int animation_running,
-    const char *status_message)
+    int animation_running)
 {
     RECT client;
     GetClientRect(window, &client);
@@ -877,7 +1214,8 @@ int render_direct2d(
         renderer,
         &display_track,
         &client);
-    if (animation_running)
+    if (animation_running ||
+        (training_running && training->render_car_during_training))
         center_track_render_view_on(
             renderer, &view, &client, display_car.position);
     int split = view.map_width;
@@ -915,9 +1253,11 @@ int render_direct2d(
     }
 
     d2d_target->SetTransform(D2D1::Matrix3x2F::Identity());
+    draw_track_segment_selection(
+        renderer, &display_track, &view, training);
     d2d_target->PopAxisAlignedClip();
 
-    if (!training_running) {
+    if (!training_running || training->render_car_during_training) {
         D2D1_POINT_2F car_screen = track_screen_point(
             display_car.position, &view);
         float screen_heading =
@@ -1146,7 +1486,6 @@ int render_direct2d(
     char best_average_speed_text[32];
     char best_top_speed_text[32];
     char average_progress_reward_text[32];
-    char average_control_penalty_text[32];
     char off_track_text[32];
     char lap_completion_text[32];
     char median_progress_text[32];
@@ -1238,9 +1577,6 @@ int render_direct2d(
         snprintf(average_progress_reward_text,
                  sizeof(average_progress_reward_text),
                  "%.3f", ga_training.reported_average_progress_reward);
-        snprintf(average_control_penalty_text,
-                 sizeof(average_control_penalty_text),
-                 "%.3f", ga_training.reported_average_control_penalty);
         snprintf(off_track_text, sizeof(off_track_text),
                  "%.1f%%", ga_training.reported_off_track_percentage);
         snprintf(lap_completion_text, sizeof(lap_completion_text),
@@ -1262,8 +1598,6 @@ int render_direct2d(
                  sizeof(best_top_speed_text), "--");
         snprintf(average_progress_reward_text,
                  sizeof(average_progress_reward_text), "--");
-        snprintf(average_control_penalty_text,
-                 sizeof(average_control_penalty_text), "--");
         snprintf(off_track_text, sizeof(off_track_text), "--");
         snprintf(lap_completion_text, sizeof(lap_completion_text), "--");
         snprintf(median_progress_text, sizeof(median_progress_text), "--");
@@ -1276,29 +1610,95 @@ int render_direct2d(
     float result_left = split + 40.0f;
     float result_right = (float)client.right - 40.0f;
     float result_y = 82.0f;
+    TrainingTrendAnalysis trend_analysis;
+    analyze_training_trend(training, &trend_analysis);
+    ID2D1Brush *trend_brush = trend_analysis.warming_up
+        ? d2d_amber_brush
+        : trend_analysis.direction > 0
+            ? d2d_green_brush
+            : trend_analysis.direction < 0
+                ? d2d_red_brush
+                : d2d_amber_brush;
     if (training_running) {
-        const char *train_labels[] = {
-            "Generations", "Generation elapsed", "Population", "Best fitness",
-            "Average fitness", "Avg speed", "Top speed",
-            "Mean progress reward", "Mean control penalty",
-            "Off-track", "Lap completion", "Median progress",
-            "Performance blend" };
-        const char *train_values[] = {
-            generation_text, generation_elapsed_text,
-            population_text, best_fitness_text,
-            average_fitness_text, best_average_speed_text,
-            best_top_speed_text, average_progress_reward_text,
-            average_control_penalty_text, off_track_text,
-            lap_completion_text, median_progress_text,
-            curriculum_blend_text };
-        for (int row = 0; row < 13; row++) {
-            draw_d2d_pane_text(renderer, train_labels[row], result_left, result_y,
-                               result_right - result_left, 22.0f,
-                               d2d_pane_label_brush);
-            draw_d2d_right_text(renderer, train_values[row], result_left, result_y,
-                                result_right - result_left, 26.0f);
-            result_y += 32.0f;
-        }
+        const char *trend_text = trend_analysis.warming_up
+            ? "... WARMING UP"
+            : trend_analysis.direction > 0
+                ? "\xE2\x96\xB2 IMPROVING"
+                : trend_analysis.direction < 0
+                    ? "\xE2\x96\xBC REGRESSING"
+                    : "\xE2\x86\x92 STABLE";
+        draw_training_row(
+            renderer, "Training trend", trend_text,
+            result_left, result_right, result_y, trend_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Learning phase", trend_analysis.phase,
+            result_left, result_right, result_y, d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Confidence", trend_analysis.confidence,
+            result_left, result_right, result_y,
+            trend_analysis.warming_up
+                ? d2d_amber_brush
+                : d2d_pane_value_brush);
+        result_y += 34.0f;
+
+        draw_training_row(
+            renderer, "Generations", generation_text,
+            result_left, result_right, result_y, d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Generation elapsed", generation_elapsed_text,
+            result_left, result_right, result_y, d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Best fitness", best_fitness_text,
+            result_left, result_right, result_y, d2d_pane_value_brush);
+        result_y += 26.0f;
+
+        draw_training_row(
+            renderer, "Average fitness", average_fitness_text,
+            result_left, result_right, result_y,
+            d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer,
+            training->fitness_function == TRAINING_FITNESS_CURRICULUM
+                ? "Median progress"
+                : "Mean progress reward",
+            training->fitness_function == TRAINING_FITNESS_CURRICULUM
+                ? median_progress_text
+                : average_progress_reward_text,
+            result_left, result_right, result_y,
+            d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer,
+            training->use_track_segment
+                ? "Segment completion"
+                : "Lap completion",
+            lap_completion_text,
+            result_left, result_right, result_y,
+            d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Off-track", off_track_text,
+            result_left, result_right, result_y,
+            d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Average speed", best_average_speed_text,
+            result_left, result_right, result_y,
+            d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Top speed", best_top_speed_text,
+            result_left, result_right, result_y, d2d_pane_value_brush);
+        result_y += 26.0f;
+        draw_training_row(
+            renderer, "Performance blend", curriculum_blend_text,
+            result_left, result_right, result_y, d2d_pane_value_brush);
+        result_y += 26.0f;
     } else {
         const char *run_labels[] = {
             "Speed", "Target speed", "Actual lateral", "Target lateral",
@@ -1328,7 +1728,13 @@ int render_direct2d(
     float source_y = command_y -
         RIGHT_PANE_TRAIN_SOURCE_GAP -
         RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
-    float fitness_y = source_y -
+    float scope_y = source_y -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
+    float training_car_y = scope_y -
+        RIGHT_PANE_TRAIN_SOURCE_GAP -
+        RIGHT_PANE_TRAIN_SOURCE_HEIGHT;
+    float fitness_y = training_car_y -
         RIGHT_PANE_TRAIN_SOURCE_GAP -
         RIGHT_PANE_FITNESS_BUTTON_HEIGHT;
     if (!training_running) {
@@ -1418,6 +1824,67 @@ int render_direct2d(
         source_disabled
             ? d2d_pane_label_brush
             : d2d_pane_value_brush);
+
+    float scope_left = source_left;
+    D2D1_RECT_F scope_rect = D2D1::RectF(
+        scope_left,
+        scope_y,
+        scope_left + RIGHT_PANE_TRAIN_SOURCE_WIDTH,
+        scope_y + RIGHT_PANE_TRAIN_SOURCE_HEIGHT);
+    int scope_disabled = right_pane_command_is_disabled(
+        8, training_running, training->workers_active);
+    d2d_target->FillRectangle(
+        scope_rect,
+        scope_disabled
+            ? d2d_pane_background_brush
+            : command_hover == 108
+                ? d2d_command_hover_brush
+                : d2d_command_brush);
+    d2d_target->DrawRectangle(
+        scope_rect, d2d_pane_border_brush, 1.0f);
+    char scope_text[64];
+    if (training->track_segment_selection_stage == 1) {
+        snprintf(scope_text, sizeof(scope_text), "Pick start point on track");
+    } else if (training->track_segment_selection_stage == 2) {
+        snprintf(scope_text, sizeof(scope_text), "Pick end point on track");
+    } else if (training->use_track_segment) {
+        snprintf(
+            scope_text,
+            sizeof(scope_text),
+            "Scope: Points %d-%d",
+            training->track_segment_start_geojson_index,
+            training->track_segment_end_geojson_index);
+    } else {
+        snprintf(scope_text, sizeof(scope_text), "Scope: Full lap");
+    }
+    draw_d2d_button_text(
+        renderer,
+        scope_text,
+        &scope_rect,
+        scope_disabled
+            ? d2d_pane_label_brush
+            : d2d_pane_value_brush);
+
+    float training_car_left = source_left;
+    D2D1_RECT_F training_car_rect = D2D1::RectF(
+        training_car_left,
+        training_car_y,
+        training_car_left + RIGHT_PANE_TRAIN_SOURCE_WIDTH,
+        training_car_y + RIGHT_PANE_TRAIN_SOURCE_HEIGHT);
+    d2d_target->FillRectangle(
+        training_car_rect,
+        command_hover == 109
+            ? d2d_command_hover_brush
+            : d2d_command_brush);
+    d2d_target->DrawRectangle(
+        training_car_rect, d2d_pane_border_brush, 1.0f);
+    draw_d2d_button_text(
+        renderer,
+        training->render_car_during_training
+            ? "Training car: On"
+            : "Training car: Off",
+        &training_car_rect,
+        d2d_pane_value_brush);
 
     const char *labels[4] = {
         training_running ? "Stop" : "Train",
