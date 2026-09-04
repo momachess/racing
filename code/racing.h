@@ -95,6 +95,7 @@ static_assert(
 #define RUN_CHART_SAMPLE_COUNT 300
 #define RUN_CHART_SAMPLE_INTERVAL_MS 100
 #define RUN_CHART_ACCELERATION_RANGE 20.0f
+#define LAP_TELEMETRY_SAMPLE_COUNT 320
 
 /* ================================================================
    BASIC TYPES
@@ -390,6 +391,13 @@ typedef struct {
 } RunChartSample;
 
 typedef struct {
+    float speed_kmh;
+    float brake;
+    float steering_degrees;
+    unsigned char valid;
+} LapTelemetrySample;
+
+typedef struct {
     ID2D1Factory *d2d_factory;
     ID2D1StrokeStyle *d2d_round_stroke;
     ID2D1HwndRenderTarget *d2d_target;
@@ -434,6 +442,13 @@ typedef struct {
     int run_chart_next_sample;
     ULONGLONG run_chart_last_sample_tick;
     int run_chart_sampling;
+    LapTelemetrySample current_lap_telemetry[LAP_TELEMETRY_SAMPLE_COUNT];
+    LapTelemetrySample last_lap_telemetry[LAP_TELEMETRY_SAMPLE_COUNT];
+    int lap_telemetry_sampling;
+    int lap_telemetry_last_available;
+    int lap_telemetry_observed_lap_count;
+    float lap_telemetry_previous_elapsed;
+    int lap_telemetry_has_previous_sample;
 } RendererContext;
 
 typedef struct {

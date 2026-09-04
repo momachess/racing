@@ -993,6 +993,195 @@ void update_run_chart(
         renderer->run_chart_sample_count++;
 }
 
+static void clear_current_lap_telemetry(RendererContext *renderer)
+{
+    memset(
+        renderer->current_lap_telemetry,
+        0,
+        sizeof(renderer->current_lap_telemetry));
+    renderer->lap_telemetry_has_previous_sample = 0;
+}
+
+static void update_lap_telemetry(
+    RendererContext *renderer,
+    const RacingEnv *environment,
+    const TrainingContext *training)
+{
+    int sampling = training->running &&
+        training->render_car_during_training &&
+        display_track.total_length > 0.0f;
+    if (!sampling) {
+        renderer->lap_telemetry_sampling = 0;
+        return;
+    }
+
+    float progress = display_car.track_s / display_track.total_length;
+    progress = fmaxf(0.0f, fminf(progress, 1.0f));
+
+    if (!renderer->lap_telemetry_sampling) {
+        memset(
+            renderer->last_lap_telemetry,
+            0,
+            sizeof(renderer->last_lap_telemetry));
+        clear_current_lap_telemetry(renderer);
+        renderer->lap_telemetry_last_available = 0;
+        renderer->lap_telemetry_observed_lap_count =
+            display_car.lap_count;
+        renderer->lap_telemetry_sampling = 1;
+    } else if (display_car.lap_count >
+               renderer->lap_telemetry_observed_lap_count)
+    {
+        memcpy(
+            renderer->last_lap_telemetry,
+            renderer->current_lap_telemetry,
+            sizeof(renderer->last_lap_telemetry));
+        renderer->lap_telemetry_last_available = 1;
+        clear_current_lap_telemetry(renderer);
+        renderer->lap_telemetry_observed_lap_count =
+            display_car.lap_count;
+    } else if (display_car.lap_count <
+                   renderer->lap_telemetry_observed_lap_count ||
+               (renderer->lap_telemetry_has_previous_sample &&
+                display_car.lap_elapsed + 0.001f <
+                    renderer->lap_telemetry_previous_elapsed))
+    {
+        /* A training preview restart is not a completed lap. Keep the last
+           completed lap but discard the interrupted current trace. */
+        clear_current_lap_telemetry(renderer);
+        renderer->lap_telemetry_observed_lap_count =
+            display_car.lap_count;
+    }
+
+    int index = (int)(
+        progress * (LAP_TELEMETRY_SAMPLE_COUNT - 1) + 0.5f);
+    LapTelemetrySample *sample =
+        &renderer->current_lap_telemetry[index];
+    sample->speed_kmh = display_car.v_x * 3.6f;
+    sample->brake = fmaxf(0.0f, fminf(display_car.brake, 1.0f));
+    sample->steering_degrees = display_car.steering_angle *
+        180.0f / (float)M_PI;
+    sample->valid = 1;
+    renderer->lap_telemetry_previous_elapsed = display_car.lap_elapsed;
+    renderer->lap_telemetry_has_previous_sample = 1;
+}
+
+static float lap_telemetry_value(
+    const LapTelemetrySample *sample,
+    int channel)
+{
+    if (channel == 0)
+        return sample->speed_kmh;
+    if (channel == 1)
+        return sample->brake;
+    return sample->steering_degrees;
+}
+
+static void draw_lap_telemetry_trace(
+    RendererContext *renderer,
+    const LapTelemetrySample samples[LAP_TELEMETRY_SAMPLE_COUNT],
+    const D2D1_RECT_F *plot,
+    int channel,
+    float minimum,
+    float maximum,
+    ID2D1Brush *brush,
+    float stroke_width)
+{
+    D2D1_POINT_2F previous = {};
+    int previous_valid = 0;
+    float range = fmaxf(maximum - minimum, 1e-6f);
+    for (int index = 0; index < LAP_TELEMETRY_SAMPLE_COUNT; index++) {
+        if (!samples[index].valid) {
+            previous_valid = 0;
+            continue;
+        }
+        float amount = (lap_telemetry_value(&samples[index], channel) -
+                        minimum) / range;
+        amount = fmaxf(0.0f, fminf(amount, 1.0f));
+        D2D1_POINT_2F point = D2D1::Point2F(
+            plot->left + (plot->right - plot->left) * index /
+                (float)(LAP_TELEMETRY_SAMPLE_COUNT - 1),
+            plot->bottom - amount * (plot->bottom - plot->top));
+        if (previous_valid)
+            d2d_target->DrawLine(previous, point, brush, stroke_width);
+        previous = point;
+        previous_valid = 1;
+    }
+}
+
+static void draw_lap_telemetry_chart(
+    RendererContext *renderer,
+    const char *title,
+    const char *value_text,
+    int channel,
+    float minimum,
+    float maximum,
+    float left,
+    float top,
+    float right,
+    float bottom)
+{
+    if (bottom - top < 52.0f)
+        return;
+
+    draw_d2d_pane_text(
+        renderer, title, left, top, (right - left) * 0.34f, 18.0f,
+        d2d_pane_label_brush);
+    draw_d2d_pane_text(
+        renderer, value_text, left + (right - left) * 0.34f, top,
+        (right - left) * 0.30f, 18.0f, d2d_pane_value_brush);
+    draw_d2d_pane_text(
+        renderer, "Last", left + (right - left) * 0.64f, top,
+        (right - left) * 0.16f, 18.0f, d2d_amber_brush);
+    draw_d2d_pane_text(
+        renderer, "Current", left + (right - left) * 0.80f, top,
+        (right - left) * 0.20f, 18.0f, d2d_blue_brush);
+
+    D2D1_RECT_F plot = D2D1::RectF(left, top + 20.0f, right, bottom);
+    d2d_target->FillRectangle(plot, d2d_command_brush);
+    for (int grid = 1; grid < 4; grid++) {
+        float x = plot.left + (plot.right - plot.left) * grid / 4.0f;
+        d2d_target->DrawLine(
+            D2D1::Point2F(x, plot.top),
+            D2D1::Point2F(x, plot.bottom),
+            d2d_pane_border_brush,
+            0.5f);
+    }
+    for (int grid = 1; grid < 4; grid++) {
+        float y = plot.top + (plot.bottom - plot.top) * grid / 4.0f;
+        d2d_target->DrawLine(
+            D2D1::Point2F(plot.left, y),
+            D2D1::Point2F(plot.right, y),
+            d2d_pane_border_brush,
+            channel == 2 && grid == 2 ? 1.0f : 0.5f);
+    }
+    d2d_target->DrawRectangle(plot, d2d_pane_border_brush, 1.0f);
+
+    if (renderer->lap_telemetry_sampling &&
+        renderer->lap_telemetry_last_available)
+    {
+        draw_lap_telemetry_trace(
+            renderer,
+            renderer->last_lap_telemetry,
+            &plot,
+            channel,
+            minimum,
+            maximum,
+            d2d_amber_brush,
+            1.25f);
+    }
+    if (renderer->lap_telemetry_sampling) {
+        draw_lap_telemetry_trace(
+            renderer,
+            renderer->current_lap_telemetry,
+            &plot,
+            channel,
+            minimum,
+            maximum,
+            d2d_blue_brush,
+            1.75f);
+    }
+}
+
 
 void draw_run_chart(
     RendererContext *renderer,
@@ -1209,6 +1398,7 @@ int render_direct2d(
         environment,
         animation_running,
         training_running);
+    update_lap_telemetry(renderer, environment, training);
 
     TrackRenderView view = make_track_render_view(
         renderer,
@@ -1737,7 +1927,52 @@ int render_direct2d(
     float fitness_y = training_car_y -
         RIGHT_PANE_TRAIN_SOURCE_GAP -
         RIGHT_PANE_FITNESS_BUTTON_HEIGHT;
-    if (!training_running) {
+    if (training_running) {
+        float charts_top = result_y + 8.0f;
+        float charts_bottom = fitness_y - 14.0f;
+        float chart_gap = 8.0f;
+        float chart_height =
+            (charts_bottom - charts_top - chart_gap * 2.0f) / 3.0f;
+        if (chart_height >= 52.0f) {
+            char telemetry_speed[32];
+            char telemetry_brake[32];
+            char telemetry_steering[32];
+            if (training->render_car_during_training) {
+                snprintf(telemetry_speed, sizeof(telemetry_speed),
+                         "%.0f km/h", display_car.v_x * 3.6f);
+                snprintf(telemetry_brake, sizeof(telemetry_brake),
+                         "%.0f%%", display_car.brake * 100.0f);
+                snprintf(telemetry_steering, sizeof(telemetry_steering),
+                         "%+.1f deg", display_car.steering_angle *
+                             180.0f / (float)M_PI);
+            } else {
+                snprintf(telemetry_speed, sizeof(telemetry_speed), "--");
+                snprintf(telemetry_brake, sizeof(telemetry_brake), "--");
+                snprintf(telemetry_steering, sizeof(telemetry_steering), "--");
+            }
+            float steering_limit = fmaxf(
+                car_parameters.max_steering_angle *
+                    180.0f / (float)M_PI,
+                1.0f);
+            draw_lap_telemetry_chart(
+                renderer, "Speed", telemetry_speed, 0,
+                0.0f, fmaxf(car_parameters.max_speed_kmh, 1.0f),
+                result_left, charts_top, result_right,
+                charts_top + chart_height);
+            charts_top += chart_height + chart_gap;
+            draw_lap_telemetry_chart(
+                renderer, "Braking", telemetry_brake, 1,
+                0.0f, 1.0f,
+                result_left, charts_top, result_right,
+                charts_top + chart_height);
+            charts_top += chart_height + chart_gap;
+            draw_lap_telemetry_chart(
+                renderer, "Steering", telemetry_steering, 2,
+                -steering_limit, steering_limit,
+                result_left, charts_top, result_right,
+                charts_top + chart_height);
+        }
+    } else {
         float chart_bottom = fitness_y - 14.0f;
         float chart_top = fmaxf(result_y + 8.0f, chart_bottom - 200.0f);
         draw_run_chart(
